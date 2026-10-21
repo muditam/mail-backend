@@ -1,22 +1,25 @@
 # 60Brands mail backend
 
-Node.js 22+ / TypeScript / Fastify backend for the existing `mail-frontend`. It exposes `/api/app/v1` on port 3000 by default. Stalwart remains the mailbox and message store. Local SQLite holds only app sessions, encrypted OAuth token material, temporary blob references, and send attempt hashes.
+Node.js 22+ / TypeScript / Fastify backend for the existing `mail-frontend`. It exposes `/api/app/v1` on port 3000 by default. Stalwart remains the mailbox and message store. MongoDB holds only app sessions, encrypted OAuth token material, temporary blob references, and send attempt hashes.
+
+Authenticated mailbox refreshes are limited per session to 30 folder-list requests and 60 message-list requests per minute before any Stalwart call. The current limiter is process local, so these ceilings apply independently on each web dyno.
 
 ## Run locally
 
 ```bash
 npm install
 cp .env.example .env
-# Set SESSION_ENCRYPTION_KEY, OAuth client values, and URLs in .env.
-set -a; source .env; set +a
+# Set MONGODB_URI, SESSION_ENCRYPTION_KEY, OAuth client values, and URLs in .env.
 npm run dev
 ```
 
-Keep `.env`, the SQLite database, and its backups private. The database schema is created automatically at startup; no separate migration command is needed. `npm run check`, `npm test`, and `npm run build` validate the package. `npm start` runs `dist/server.js` after a build. `/health` checks the process; `/ready` checks SQLite. Neither endpoint tests upstream auth.
+Use a dedicated MongoDB database and a database user with access only to it. The app creates its collections and expiration indexes on startup; the user needs index creation permission. Keep `MONGODB_URI` and `SESSION_ENCRYPTION_KEY` in environment secrets, never in source control. The server automatically loads `mail-backend/.env` when present; environment variables supplied by Heroku or your shell take precedence. `npm run check`, `npm test`, and `npm run build` validate the package. Tests start a temporary local MongoDB instance; they never use your configured cluster. `npm start` runs `dist/server.js` after a build. `/health` checks the process; `/ready` pings MongoDB. Neither endpoint tests upstream auth.
+
+`MONGODB_URI` is required; `MONGODB_DB_NAME` defaults to `webmail`. For Heroku, set the URI and encryption key as config vars, set `HOST=0.0.0.0`, and deploy the backend with the frontend on the same HTTPS origin or proxy `/api` to the backend. The backend currently has no active MongoDB credentials and has not been tested against your own cluster. Its user must be able to reach the cluster from the Heroku dyno.
 
 The frontend currently reopens drafts without restoring Bcc recipients; verify that UI behavior during integration before relying on saved Bcc drafts.
 
-The frontend's Vite proxy already points `/api` at `http://localhost:3000`. Use `VITE_USE_MOCK_API=false`. `APP_ORIGIN` must be the exact browser origin (`http://localhost:5173` locally). Production must use a single HTTPS origin or an explicitly designed credentialed CORS setup; this backend currently assumes the single-origin reverse-proxy arrangement. Set the OAuth redirect URI to the exact URI registered for this client in Stalwart. The BFF exchanges codes server to server and does not need a browser callback route, but Stalwart may require a registered redirect URI match.
+The frontend reads its own `.env`: `VITE_API_BASE_URL` controls the browser API path and `DEV_API_PROXY_TARGET` controls Vite's local proxy. Keep the frontend proxy target aligned with this backend's `HOST` and `PORT`. `APP_ORIGIN` must be the exact browser origin (`http://localhost:5173` locally). Production must use a single HTTPS origin; this backend currently assumes the single-origin arrangement. Set `STALWART_URL`, `STALWART_AUTH_URL`, `STALWART_TOKEN_URL`, and `STALWART_JMAP_SESSION_URL` in the backend environment. The latter three must use the same HTTPS origin as `STALWART_URL`. JMAP API, upload, and download URLs come from Stalwart's authenticated session discovery response. Set the OAuth redirect URI to the exact URI registered for this client in Stalwart. The BFF exchanges codes server to server and does not need a browser callback route, but Stalwart may require a registered redirect URI match.
 
 ## API contract
 
@@ -24,7 +27,7 @@ See `openapi.yaml`. All application routes are under `/api/app/v1`; the frontend
 
 ## Security and operations
 
-The backend binds to `127.0.0.1` by default. In production, put it behind a TLS reverse proxy that serves the frontend and `/api/app/v1/*` from one origin. Forward the actual `Origin` header and avoid rewriting cookie attributes. Do not publicly expose port 3000. The app checks Stalwart URLs against `STALWART_URL`'s HTTPS origin to avoid following arbitrary advertised hosts. Adjust that rule only after verifying a deliberate separate JMAP host. Store `SESSION_ENCRYPTION_KEY` in a secret manager and back up SQLite with access controls. Changing the key invalidates persisted sessions. Idle expiry is 30 minutes by default; the browser cookie has the same maximum age from login, while the server also imposes a 12-hour absolute cap. Restart preserves unexpired sessions. Logout deletes local session and upload references. Upstream token revocation is not attempted because the live OAuth discovery currently advertises no revocation endpoint.
+The backend binds to `127.0.0.1` by default. In production, serve the frontend and `/api/app/v1/*` from one HTTPS origin. Forward the actual `Origin` header and avoid rewriting cookie attributes. The app checks Stalwart URLs against `STALWART_URL`'s HTTPS origin to avoid following arbitrary advertised hosts. Adjust that rule only after verifying a deliberate separate JMAP host. Store `SESSION_ENCRYPTION_KEY` in a secret manager and back up MongoDB with access controls. Changing the key invalidates persisted sessions. Idle expiry is 30 minutes by default; the browser cookie has the same maximum age from login, while the server also imposes a 12-hour absolute cap. Restart preserves unexpired sessions. Logout deletes the MongoDB session, upload references, and send attempt records. Upstream token revocation is not attempted because the live OAuth discovery currently advertises no revocation endpoint.
 
 The app does not log request bodies, passwords, tokens, message contents, or attachment bytes. It does not render HTML mail. Uploaded blobs are stored in Stalwart; this service stores only short-lived references. A repeated identical send payload within 24 hours in the same app session returns `SEND_STATUS_UNKNOWN` to avoid duplicate submissions after a timeout. Confirm Sent before creating a new send attempt.
 
