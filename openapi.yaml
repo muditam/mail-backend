@@ -1,0 +1,144 @@
+openapi: 3.0.3
+info:
+  title: 60Brands Webmail BFF
+  version: 0.1.0
+servers:
+  - url: /api/app/v1
+components:
+  securitySchemes:
+    sessionCookie:
+      type: apiKey
+      in: cookie
+      name: webmail_sid
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, requestId]
+          properties:
+            code: {type: string}
+            message: {type: string}
+            requestId: {type: string}
+    DraftPayload:
+      type: object
+      required: [to, subject, bodyText, attachmentIds]
+      properties:
+        draftId: {type: string}
+        to: {type: array, items: {type: string, format: email}}
+        cc: {type: array, items: {type: string, format: email}}
+        bcc: {type: array, items: {type: string, format: email}}
+        subject: {type: string}
+        bodyText: {type: string}
+        attachmentIds: {type: array, items: {type: string}}
+security:
+  - sessionCookie: []
+paths:
+  /auth/login:
+    post:
+      security: []
+      summary: Authenticate mailbox user
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: {type: string, format: email}
+                password: {type: string}
+      responses:
+        '200': {description: 'Session with user and CSRF token'}
+        '401': {description: Invalid credentials}
+  /auth/session:
+    get:
+      summary: Restore session
+      responses:
+        '200': {description: 'User and rotated CSRF token'}
+        '401': {description: Session expired}
+  /auth/logout:
+    post:
+      summary: End session
+      parameters: [{in: header, name: X-CSRF-Token, required: true, schema: {type: string}}]
+      responses:
+        '204': {description: Logged out}
+  /mailboxes:
+    get:
+      summary: List current user mailboxes
+      responses:
+        '200': {description: 'mailboxes array'}
+  /messages:
+    get:
+      summary: List messages in newest-first order
+      parameters:
+        - {in: query, name: mailboxId, required: true, schema: {type: string}}
+        - {in: query, name: cursor, schema: {type: string}}
+        - {in: query, name: limit, schema: {type: integer, minimum: 1, maximum: 100}}
+      responses:
+        '200': {description: 'messages array and optional nextCursor'}
+  /messages/{id}:
+    parameters: [{in: path, name: id, required: true, schema: {type: string}}]
+    get:
+      summary: Get message with plain-text body and attachment metadata
+      responses:
+        '200': {description: 'message object'}
+    patch:
+      summary: Set read status
+      parameters: [{in: header, name: X-CSRF-Token, required: true, schema: {type: string}}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {type: object, required: [isRead], properties: {isRead: {type: boolean}}}
+      responses:
+        '200': {description: 'message id and isRead'}
+  /messages/send:
+    post:
+      summary: Submit a message
+      parameters: [{in: header, name: X-CSRF-Token, required: true, schema: {type: string}}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DraftPayload'}
+      responses:
+        '202': {description: 'submissionId and queued status'}
+  /attachments:
+    post:
+      summary: Upload an attachment
+      parameters: [{in: header, name: X-CSRF-Token, required: true, schema: {type: string}}]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema: {type: object, required: [file], properties: {file: {type: string, format: binary}}}
+      responses:
+        '201': {description: 'attachment metadata'}
+  /attachments/{id}:
+    get:
+      summary: Download an authorized attachment
+      parameters: [{in: path, name: id, required: true, schema: {type: string}}]
+      responses:
+        '200': {description: File bytes}
+  /drafts:
+    post:
+      summary: Create or replace draft
+      parameters: [{in: header, name: X-CSRF-Token, required: true, schema: {type: string}}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/DraftPayload'}
+      responses:
+        '200': {description: draftId}
+  /drafts/{id}:
+    delete:
+      summary: Delete draft
+      parameters:
+        - {in: path, name: id, required: true, schema: {type: string}}
+        - {in: header, name: X-CSRF-Token, required: true, schema: {type: string}}
+      responses:
+        '204': {description: Draft deleted}
