@@ -22,6 +22,20 @@ components:
             code: {type: string}
             message: {type: string}
             requestId: {type: string}
+    Safety:
+      type: object
+      required: [classification, fromDomain, authentication, spam]
+      properties:
+        classification: {type: string, enum: [internal, external, suspicious]}
+        fromDomain: {type: string, nullable: true}
+        authentication: {type: string, enum: [aligned, unverified]}
+        spam: {type: boolean}
+    MessageSummary:
+      type: object
+      required: [id, safety]
+      properties:
+        id: {type: string}
+        safety: {$ref: '#/components/schemas/Safety'}
     DraftPayload:
       type: object
       required: [to, subject, bodyText, attachmentIds]
@@ -78,13 +92,28 @@ paths:
         - {in: query, name: cursor, schema: {type: string}}
         - {in: query, name: limit, schema: {type: integer, minimum: 1, maximum: 100}}
       responses:
-        '200': {description: 'messages array and optional nextCursor'}
+        '200':
+          description: Messages with backend-derived safety and optional nextCursor
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  messages: {type: array, items: {$ref: '#/components/schemas/MessageSummary'}}
+                  nextCursor: {type: string}
   /messages/{id}:
     parameters: [{in: path, name: id, required: true, schema: {type: string}}]
     get:
       summary: Get message with plain-text body and attachment metadata
       responses:
-        '200': {description: 'message object'}
+        '200':
+          description: Message with bodyText, attachments and backend-derived safety
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: {$ref: '#/components/schemas/MessageSummary'}
     patch:
       summary: Set read status
       parameters: [{in: header, name: X-CSRF-Token, required: true, schema: {type: string}}]
@@ -142,3 +171,31 @@ paths:
         - {in: header, name: X-CSRF-Token, required: true, schema: {type: string}}
       responses:
         '204': {description: Draft deleted}
+  /messages/{id}/report:
+    parameters: [{in: path, name: id, required: true, schema: {type: string}}]
+    post:
+      summary: Report server-fetched message metadata to the configured IT recipient
+      description: Requires same-origin session and CSRF. No original body, preview, attachments or raw headers are forwarded. Missing configuration and upstream failures never return success.
+      parameters: [{in: header, name: X-CSRF-Token, required: true, schema: {type: string}}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {type: object, additionalProperties: false}
+      responses:
+        '202':
+          description: Accepted by the mail server for delivery (not a delivery receipt)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, submissionId]
+                properties:
+                  status: {type: string, enum: [queued]}
+                  submissionId: {type: string}
+        '400': {description: Invalid payload}
+        '401': {description: Session expired}
+        '403': {description: Origin or CSRF validation failed}
+        '404': {description: Message unavailable in this account}
+        '429': {description: Report rate limit exceeded}
+        '503': {description: Reporting unavailable or submission status unknown}
