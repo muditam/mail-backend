@@ -13,6 +13,28 @@ test('malformed, multiple, missing or unverified senders fail closed',()=>{
  assert.equal(classifySafety(message('a@muditam.com'),{}).classification,'suspicious');
  const m=message('a@muditam.com');m[safetyProperties[0]].push(m[safetyProperties[0]][0]);assert.equal(classifySafety(m,config).classification,'suspicious');
 });
+test('complete sender syntax rejects malformed dot atoms and invalid mailbox lengths',()=>{
+ for(const email of ['a..b@muditam.com','.a@muditam.com','a.@muditam.com','a[b]@muditam.com','a@muditam.com\n',`${'a'.repeat(65)}@muditam.com`,`a@${'b'.repeat(64)}.com`]){
+  assert.deepEqual(classifySafety(message(email),config),{classification:'suspicious',fromDomain:null,authentication:'unverified',spam:false},email);
+ }
+ for(const email of ['first.last@muditam.com',"a+b!#$%&'*-/=?^_`{|}~@muditam.com"]){
+  assert.equal(classifySafety(message(email),config).classification,'internal',email);
+ }
+});
+test('duplicate header.from properties cannot establish alignment',()=>{
+ for(const properties of [
+  'header.from=muditam.com header.from=evil.test',
+  'header.from=evil.test header.from=muditam.com',
+  'header.from=muditam.com header.from=muditam.com',
+  'header.from=muditam.com HEADER.FROM = evil.test',
+  'header.from=muditam.com; spf=pass header.from=evil.test',
+  '',
+ ]){
+  const safety=classifySafety(message('a@muditam.com',`mx.muditam.com; dmarc=pass ${properties}`),config);
+  assert.equal(safety.classification,'suspicious',properties);
+  assert.equal(safety.authentication,'unverified',properties);
+ }
+});
 test('spam results raise a stronger warning',()=>{
  const m={...message('a@muditam.com'),[safetyProperties[1]]:['spam; score=12']};
  assert.deepEqual(classifySafety(m,config),{classification:'suspicious',fromDomain:'muditam.com',authentication:'aligned',spam:true});
