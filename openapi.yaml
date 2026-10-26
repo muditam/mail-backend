@@ -197,3 +197,28 @@ paths:
         '404': {description: Message unavailable in this account}
         '429': {description: Report rate limit exceeded}
         '503': {description: Reporting unavailable or submission status unknown}
+  /messages/{id}/move:
+    post:
+      summary: Move a message to Trash or restore it
+      description: Restore moves drafts to Drafts and other messages to Inbox. Content and keywords are preserved. Repeated operations are harmless. Requires session, same-origin request and CSRF token.
+      parameters:
+        - {in: path, name: id, required: true, schema: {type: string}}
+        - {in: header, name: X-CSRF-Token, required: true, schema: {type: string}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [action]
+              properties:
+                action: {type: string, enum: [trash, restore]}
+      responses:
+        '200': {description: 'message containing id and resulting mailboxIds'}
+        '400': {description: Invalid action or payload}
+        '401': {description: Session expired}
+        '403': {description: Origin or CSRF check failed}
+        '404': {description: Message or destination folder unavailable}
+        '429': {description: Move rate limit exceeded}
+        '503': {description: Move could not be confirmed; refresh before retrying}

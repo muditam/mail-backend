@@ -65,6 +65,27 @@ export class Stalwart {
     return this.send(s,{to:[this.config.IT_REPORT_EMAIL],cc:[],bcc:[],subject:'Reported suspicious email',bodyText:JSON.stringify(metadata,null,2),attachmentIds:[]});
   }
   async read(s:Session,id:string,isRead:boolean){const [r]=await this.call(s,[['Email/get',{accountId:s.accountId,ids:[id],properties:['id','keywords']},'e']]);const m=r.list?.[0];if(!m)throw new AppError('MESSAGE_NOT_FOUND',404,'Message not found.');const keywords={...m.keywords};if(isRead)keywords['$seen']=true;else delete keywords['$seen'];const [updated]=await this.call(s,[['Email/set',{accountId:s.accountId,update:{[id]:{keywords}}},'u']]);if(updated.notUpdated?.[id])throw unavailable();return {id,isRead};}
+  async moveMessage(s:Session,id:string,action:'trash'|'restore'){
+    const boxes=await this.mailboxes(s);
+    const trash=boxes.find((box:any)=>box.role==='trash');
+    if(!trash)throw new AppError('MAILBOX_NOT_FOUND',404,'Trash folder is unavailable.');
+    const [result]=await this.call(s,[['Email/get',{accountId:s.accountId,ids:[id],properties:['id','mailboxIds','keywords']},'e']]);
+    const message=result.list?.find((m:any)=>m.id===id);
+    if(!message)throw new AppError('MESSAGE_NOT_FOUND',404,'Message not found.');
+    const current=Object.keys(message.mailboxIds||{});
+    // Repeated requests are harmless, including a restore retried after success.
+    if(action==='restore'&&!current.includes(trash.id))return {id,mailboxIds:current};
+    const role=action==='trash'?'trash':message.keywords?.['$draft']?'drafts':'inbox';
+    const destination=boxes.find((box:any)=>box.role===role);
+    if(!destination)throw new AppError('MAILBOX_NOT_FOUND',404,`The ${role} folder is unavailable.`);
+    if(current.length===1&&current[0]===destination.id)return {id,mailboxIds:current};
+    // Replace membership atomically, leaving content, attachments and keywords intact.
+    const [updated]=await this.call(s,[['Email/set',{accountId:s.accountId,ifInState:result.state,update:{[id]:{mailboxIds:{[destination.id]:true}}}},'u']]);
+    const failure=updated.notUpdated?.[id];
+    if(failure?.type==='notFound')throw new AppError('MESSAGE_NOT_FOUND',404,'Message not found.');
+    if(failure||!Object.prototype.hasOwnProperty.call(updated.updated||{},id))throw unavailable();
+    return {id,mailboxIds:[destination.id]};
+  }
   async upload(s:Session,bytes:Buffer,name:string,type:string){const {access,session}=await this.context(s);const url=this.safeUrl(session.uploadUrl.replace('{accountId}',encodeURIComponent(s.accountId)));let r:Response;try{r=await this.fetcher(url,{method:'POST',headers:{authorization:`Bearer ${access}`,'content-type':type},body:bytes as unknown as BodyInit,signal:timeout(30000)});}catch{throw unavailable();}if(!r.ok)throw unavailable();let body:any;try{body=await r.json();}catch{throw unavailable();}if(typeof body.blobId!=='string'||body.accountId!==s.accountId)throw unavailable();const up=await this.store.addUpload(s.id,body.blobId,name,type,bytes.length);return {id:up.id,name,type,size:bytes.length};}
   async download(s:Session,id:string){const up=await this.store.getUpload(s.id,id);if(!up)throw new AppError('ATTACHMENT_NOT_FOUND',404,'Attachment not found.');const {access,session}=await this.context(s);const url=this.safeUrl(session.downloadUrl.replace('{accountId}',encodeURIComponent(s.accountId)).replace('{blobId}',encodeURIComponent(up.blobId)).replace('{name}',encodeURIComponent(up.name)).replace('{type}',encodeURIComponent(up.type)));let r:Response;try{r=await this.fetcher(url,{headers:{authorization:`Bearer ${access}`},signal:timeout(30000)});}catch{throw unavailable();}if(!r.ok||!r.body)throw unavailable();return {body:r.body,name:up.name,type:up.type};}
   private async draftMailbox(s:Session){const boxes=await this.mailboxes(s);const box=boxes.find((x:any)=>x.role==='drafts');if(!box)throw unavailable();return box.id as string;}
