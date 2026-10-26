@@ -24,12 +24,10 @@ components:
             requestId: {type: string}
     Safety:
       type: object
-      required: [classification, fromDomain, authentication, spam]
+      required: [classification, fromDomain]
       properties:
         classification: {type: string, enum: [internal, external, suspicious]}
         fromDomain: {type: string, nullable: true}
-        authentication: {type: string, enum: [aligned, unverified]}
-        spam: {type: boolean}
     MessageSummary:
       type: object
       required: [id, safety]

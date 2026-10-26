@@ -3,7 +3,6 @@ import { z } from 'zod';
 const schema = z.object({
   INTERNAL_EMAIL_DOMAINS: z.string().default('muditam.com').refine(v => v.split(',').every(d => /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+$/i.test(d.trim())), 'Invalid internal domain list').optional(),
   IT_REPORT_EMAIL: z.string().email().optional(),
-  STALWART_AUTHSERV_ID: z.string().regex(/^[a-z0-9.-]+$/i).optional(),
   NODE_ENV: z.enum(['development','test','production']).default('development'),
   HOST: z.string().default('127.0.0.1'),
   PORT: z.coerce.number().int().min(1).max(65535).default(3000),

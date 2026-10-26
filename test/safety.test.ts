@@ -1,45 +1,35 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {classifySafety,safetyProperties} from '../src/safety.js';
-const config={INTERNAL_EMAIL_DOMAINS:'muditam.com',STALWART_AUTHSERV_ID:'mx.muditam.com'};
-const message=(email:string,auth='mx.muditam.com; dmarc=pass header.from=muditam.com')=>({from:[{email}],[safetyProperties[0]]:[auth]});
+import {classifySafety} from '../src/safety.js';
+const config={INTERNAL_EMAIL_DOMAINS:'muditam.com'};
+const message=(email:string)=>({from:[{email}]});
 test('exact domain and uppercase pass; subdomains and lookalikes remain external',()=>{
  assert.equal(classifySafety(message('a@muditam.com'),config).classification,'internal');
  assert.equal(classifySafety(message('a@MUDITAM.COM'),config).classification,'internal');
  for(const d of ['sub.muditam.com','evil-muditam.com','muditam.com.evil.test','mudltam.com'])assert.equal(classifySafety(message(`a@${d}`),config).classification,'external');
 });
-test('malformed, multiple, missing or unverified senders fail closed',()=>{
- for(const m of [{},{from:[]},{from:[{email:'bad'}]},{from:[{email:'a@muditam.com'},{email:'b@muditam.com'}]},message('a@muditam.com','evil.test; dmarc=pass header.from=muditam.com'),message('a@muditam.com','mx.muditam.com; dmarc=fail header.from=muditam.com'),message('a@muditam.com','mx.muditam.com; dmarc=pass header.from=evil.test')])assert.equal(classifySafety(m,config).classification,'suspicious');
- assert.equal(classifySafety(message('a@muditam.com'),{}).classification,'suspicious');
- const m=message('a@muditam.com');m[safetyProperties[0]].push(m[safetyProperties[0]][0]);assert.equal(classifySafety(m,config).classification,'suspicious');
+test('missing, malformed and multiple senders stay guarded',()=>{
+ for(const m of [{},{from:[]},{from:[{email:'bad'}]},{from:[{email:'a@muditam.com'},{email:'b@muditam.com'}]}])assert.equal(classifySafety(m,config).classification,'suspicious');
+ assert.equal(classifySafety(message('a@muditam.com'),{}).classification,'internal');
+});
+test('configured domains are exact, trimmed and case insensitive',()=>{
+ const configured={INTERNAL_EMAIL_DOMAINS:' MUDITAM.COM , 60brands.com '};
+ for(const email of ['a@muditam.com','a@60BRANDS.COM'])assert.equal(classifySafety(message(email),configured).classification,'internal');
+ assert.equal(classifySafety(message('a@sub.60brands.com'),configured).classification,'external');
+});
+test('authentication and spam headers do not affect the domain-only policy',()=>{
+ const headers={'header:Authentication-Results:asText:all':['mx.test; dmarc=fail'], 'header:X-Spam-Status:asText:all':['Yes']};
+ assert.equal(classifySafety({...message('a@muditam.com'),...headers},config).classification,'internal');
+ assert.equal(classifySafety({...message('a@outside.test'),...headers},config).classification,'external');
 });
 test('complete sender syntax rejects malformed dot atoms and invalid mailbox lengths',()=>{
  for(const email of ['a..b@muditam.com','.a@muditam.com','a.@muditam.com','a[b]@muditam.com','a@muditam.com\n',`${'a'.repeat(65)}@muditam.com`,`a@${'b'.repeat(64)}.com`]){
-  assert.deepEqual(classifySafety(message(email),config),{classification:'suspicious',fromDomain:null,authentication:'unverified',spam:false},email);
+  assert.deepEqual(classifySafety(message(email),config),{classification:'suspicious',fromDomain:null},email);
  }
  for(const email of ['first.last@muditam.com',"a+b!#$%&'*-/=?^_`{|}~@muditam.com"]){
   assert.equal(classifySafety(message(email),config).classification,'internal',email);
  }
 });
-test('duplicate header.from properties cannot establish alignment',()=>{
- for(const properties of [
-  'header.from=muditam.com header.from=evil.test',
-  'header.from=evil.test header.from=muditam.com',
-  'header.from=muditam.com header.from=muditam.com',
-  'header.from=muditam.com HEADER.FROM = evil.test',
-  'header.from=muditam.com; spf=pass header.from=evil.test',
-  '',
- ]){
-  const safety=classifySafety(message('a@muditam.com',`mx.muditam.com; dmarc=pass ${properties}`),config);
-  assert.equal(safety.classification,'suspicious',properties);
-  assert.equal(safety.authentication,'unverified',properties);
- }
-});
-test('spam results raise a stronger warning',()=>{
- const m={...message('a@muditam.com'),[safetyProperties[1]]:['spam; score=12']};
- assert.deepEqual(classifySafety(m,config),{classification:'suspicious',fromDomain:'muditam.com',authentication:'aligned',spam:true});
-});
-
 import {Stalwart} from '../src/stalwart.js';
 import type {Config} from '../src/config.js';
 import type {Store,Session} from '../src/store.js';
@@ -70,17 +60,13 @@ test('report route enforces session, CSRF, empty payload and propagates delivery
  assert.equal((await request(headers,{},'fail')).statusCode,503);
  }finally{await app.close();}
 });
-test('header comments cannot forge DMARC alignment and yes spam is suspicious',()=>{
- assert.equal(classifySafety(message('a@muditam.com','mx.muditam.com; dmarc=pass ( header.from=muditam.com )'),config).classification,'suspicious');
- assert.equal(classifySafety({...message('a@muditam.com'),[safetyProperties[1]]:['Yes']},config).classification,'suspicious');
-});
-test('list and detail request authentication headers and expose the same safety shape',async()=>{
+test('list and detail classify without requesting authentication or spam headers',async()=>{
  const adapter=new Stalwart({...config,STALWART_URL:'https://mail.test'} as Config,{} as Store);
  const m={...message('a@muditam.com'),id:'E1',mailboxIds:{inbox:true}};
  (adapter as any).call=async(_s:Session,calls:any[])=>{const [method,args]=calls[0];
   if(method==='Mailbox/get')return [{list:[{id:'inbox'}]}];
   if(method==='Email/query')return [{ids:['E1']}];
-  assert.ok(safetyProperties.every(p=>args.properties.includes(p)));return [{list:[m]}];
+  assert.ok(!args.properties.some((p:string)=>p.startsWith('header:')));return [{list:[m]}];
  };
  const s={accountId:'A'} as Session;
  const list=await adapter.messages(s,'inbox',0,30),detail=await adapter.message(s,'E1');
