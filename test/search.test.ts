@@ -57,7 +57,7 @@ test('search API validates input, uses the signed-in account, and limits rapid s
   assert.equal((await get('q=budget',{})).statusCode,401);
   for(const q of ['', 'q=%20%20','q='+ 'x'.repeat(257),'q=x&limit=101','q=x&cursor=-1','q=x&accountId=foreign','q=x&q=y'])assert.equal((await get(q)).statusCode,400,q);
   assert.equal(forwarded.length,0);
-  assert.equal((await get('q=%20budget%20&cursor=30&limit=10')).statusCode,200);assert.deepEqual(forwarded[0],[s,undefined,30,10,'budget']);
+  assert.equal((await get('q=%20budget%20&cursor=30&limit=10')).statusCode,200);assert.deepEqual(forwarded[0],[s,undefined,30,10,'budget',undefined]);
   for(let i=1;i<20;i++)assert.equal((await get('q=budget')).statusCode,200);
   assert.equal((await get('q=budget')).statusCode,429);assert.equal(forwarded.length,20);
   assert.equal((await get('mailboxId=inbox')).statusCode,200);
