@@ -50,8 +50,11 @@ export class Stalwart {
     return result.methodResponses.slice(0,calls.length).map(([name,value],i)=>{if(name==='error')throw unavailable();if(name!==calls[i]?.[0])throw unavailable();return value;});
   }
   async mailboxes(s:Session){const [r]=await this.call(s,[['Mailbox/get',{accountId:s.accountId,properties:['id','name','role','unreadEmails','totalEmails']},'m']]);return (r.list||[]).map((m:any)=>({id:m.id,name:m.name,role:m.role||undefined,unreadCount:m.unreadEmails||0,totalCount:m.totalEmails||0}));}
-  async messages(s:Session,mailboxId:string,cursor:number,limit:number){const [box]=await this.call(s,[['Mailbox/get',{accountId:s.accountId,ids:[mailboxId],properties:['id']},'m']]);if(!box.list?.length)throw new AppError('MAILBOX_NOT_FOUND',404,'Mailbox not found.');
-    const [query]=await this.call(s,[['Email/query',{accountId:s.accountId,filter:{inMailbox:mailboxId},sort:[{property:'receivedAt',isAscending:false}],position:cursor,limit:limit+1},'q']]);const ids=(query.ids||[]).slice(0,limit);if(!ids.length)return {messages:[]};
+  async messages(s:Session,mailboxId:string|undefined,cursor:number,limit:number,search?:string,starred?:boolean){if(mailboxId){const [box]=await this.call(s,[['Mailbox/get',{accountId:s.accountId,ids:[mailboxId],properties:['id']},'m']]);if(!box.list?.length)throw new AppError('MAILBOX_NOT_FOUND',404,'Mailbox not found.');}
+    const match=search?{operator:'OR',conditions:[{from:search},{subject:search},{body:search}]}:undefined;
+    const conditions=[...(mailboxId?[{inMailbox:mailboxId}]:[]),...(match?[match]:[]),...(starred?[{hasKeyword:'$flagged'}]:[])];
+    const filter=conditions.length>1?{operator:'AND',conditions}:conditions[0];
+    const [query]=await this.call(s,[['Email/query',{accountId:s.accountId,filter,sort:[{property:'receivedAt',isAscending:false}],position:cursor,limit:limit+1},'q']]);const ids=(query.ids||[]).slice(0,limit);if(!ids.length)return {messages:[]};
     const [get]=await this.call(s,[['Email/get',{accountId:s.accountId,ids,properties:['id','mailboxIds','from','to','subject','preview','receivedAt','keywords','attachments']},'e']]);const byId=new Map((get.list||[]).map((m:any)=>[m.id,m]));return {messages:ids.map((id:string)=>this.summary(byId.get(id))).filter(Boolean),nextCursor:query.ids.length>limit?String(cursor+limit):undefined};
   }
   private summary(m:any){if(!m)return null;return {safety:classifySafety(m,this.config),id:m.id,mailboxIds:Object.keys(m.mailboxIds||{}),from:m.from||[],to:m.to||[],subject:m.subject||'',preview:m.preview||'',receivedAt:m.receivedAt||new Date(0).toISOString(),isRead:!!m.keywords?.['$seen'],hasAttachment:!!m.attachments?.length,keywords:m.keywords||{}};}
@@ -64,13 +67,41 @@ export class Stalwart {
     const metadata={messageId:id,reporter:s.email,from:Array.isArray(m.from)?m.from.map((a:any)=>({email:String(a.email||'').slice(0,254)})):[],subject:String(m.subject||'').slice(0,998),receivedAt:String(m.receivedAt||'').slice(0,64),safety:classifySafety(m,this.config)};
     return this.send(s,{to:[this.config.IT_REPORT_EMAIL],cc:[],bcc:[],subject:'Reported suspicious email',bodyText:JSON.stringify(metadata,null,2),attachmentIds:[]});
   }
-  async read(s:Session,id:string,isRead:boolean){const [r]=await this.call(s,[['Email/get',{accountId:s.accountId,ids:[id],properties:['id','keywords']},'e']]);const m=r.list?.[0];if(!m)throw new AppError('MESSAGE_NOT_FOUND',404,'Message not found.');const keywords={...m.keywords};if(isRead)keywords['$seen']=true;else delete keywords['$seen'];const [updated]=await this.call(s,[['Email/set',{accountId:s.accountId,update:{[id]:{keywords}}},'u']]);if(updated.notUpdated?.[id])throw unavailable();return {id,isRead};}
+  async read(s:Session,id:string,isRead:boolean){const [r]=await this.call(s,[['Email/get',{accountId:s.accountId,ids:[id],properties:['id','keywords']},'e']]);const m=r.list?.[0];if(!m)throw new AppError('MESSAGE_NOT_FOUND',404,'Message not found.');const [updated]=await this.call(s,[['Email/set',{accountId:s.accountId,update:{[id]:{'keywords/$seen':isRead?true:null}}},'u']]);if(updated.notUpdated?.[id]||!Object.prototype.hasOwnProperty.call(updated.updated||{},id))throw unavailable();return {id,isRead};}
+  async star(s:Session,id:string,isStarred:boolean){
+    // Patch only this keyword so concurrent read/draft changes are preserved.
+    const [result]=await this.call(s,[['Email/set',{accountId:s.accountId,update:{[id]:{'keywords/$flagged':isStarred?true:null}}},'u']]);
+    if(result.notUpdated?.[id]?.type==='notFound')throw new AppError('MESSAGE_NOT_FOUND',404,'Message not found.');
+    if(result.notUpdated?.[id]||!Object.prototype.hasOwnProperty.call(result.updated||{},id))throw unavailable();
+    return {id,isStarred};
+  }
+  async moveMessage(s:Session,id:string,action:'trash'|'restore'){
+    const boxes=await this.mailboxes(s);
+    const trash=boxes.find((box:any)=>box.role==='trash');
+    if(!trash)throw new AppError('MAILBOX_NOT_FOUND',404,'Trash folder is unavailable.');
+    const [result]=await this.call(s,[['Email/get',{accountId:s.accountId,ids:[id],properties:['id','mailboxIds','keywords']},'e']]);
+    const message=result.list?.find((m:any)=>m.id===id);
+    if(!message)throw new AppError('MESSAGE_NOT_FOUND',404,'Message not found.');
+    const current=Object.keys(message.mailboxIds||{});
+    // Repeated requests are harmless, including a restore retried after success.
+    if(action==='restore'&&!current.includes(trash.id))return {id,mailboxIds:current};
+    const role=action==='trash'?'trash':message.keywords?.['$draft']?'drafts':'inbox';
+    const destination=boxes.find((box:any)=>box.role===role);
+    if(!destination)throw new AppError('MAILBOX_NOT_FOUND',404,`The ${role} folder is unavailable.`);
+    if(current.length===1&&current[0]===destination.id)return {id,mailboxIds:current};
+    // Replace membership atomically, leaving content, attachments and keywords intact.
+    const [updated]=await this.call(s,[['Email/set',{accountId:s.accountId,ifInState:result.state,update:{[id]:{mailboxIds:{[destination.id]:true}}}},'u']]);
+    const failure=updated.notUpdated?.[id];
+    if(failure?.type==='notFound')throw new AppError('MESSAGE_NOT_FOUND',404,'Message not found.');
+    if(failure||!Object.prototype.hasOwnProperty.call(updated.updated||{},id))throw unavailable();
+    return {id,mailboxIds:[destination.id]};
+  }
   async upload(s:Session,bytes:Buffer,name:string,type:string){const {access,session}=await this.context(s);const url=this.safeUrl(session.uploadUrl.replace('{accountId}',encodeURIComponent(s.accountId)));let r:Response;try{r=await this.fetcher(url,{method:'POST',headers:{authorization:`Bearer ${access}`,'content-type':type},body:bytes as unknown as BodyInit,signal:timeout(30000)});}catch{throw unavailable();}if(!r.ok)throw unavailable();let body:any;try{body=await r.json();}catch{throw unavailable();}if(typeof body.blobId!=='string'||body.accountId!==s.accountId)throw unavailable();const up=await this.store.addUpload(s.id,body.blobId,name,type,bytes.length);return {id:up.id,name,type,size:bytes.length};}
   async download(s:Session,id:string){const up=await this.store.getUpload(s.id,id);if(!up)throw new AppError('ATTACHMENT_NOT_FOUND',404,'Attachment not found.');const {access,session}=await this.context(s);const url=this.safeUrl(session.downloadUrl.replace('{accountId}',encodeURIComponent(s.accountId)).replace('{blobId}',encodeURIComponent(up.blobId)).replace('{name}',encodeURIComponent(up.name)).replace('{type}',encodeURIComponent(up.type)));let r:Response;try{r=await this.fetcher(url,{headers:{authorization:`Bearer ${access}`},signal:timeout(30000)});}catch{throw unavailable();}if(!r.ok||!r.body)throw unavailable();return {body:r.body,name:up.name,type:up.type};}
   private async draftMailbox(s:Session){const boxes=await this.mailboxes(s);const box=boxes.find((x:any)=>x.role==='drafts');if(!box)throw unavailable();return box.id as string;}
   private async draftObject(s:Session,p:any){const box=await this.draftMailbox(s);const attachments=await Promise.all(p.attachmentIds.map(async(id:string)=>{const up=await this.store.getUpload(s.id,id);if(!up)throw new AppError('ATTACHMENT_NOT_FOUND',404,'Attachment not found.');return {blobId:up.blobId,type:up.type,name:up.name,size:up.size};}));return {mailboxIds:{[box]:true},keywords:{'$draft':true,'$seen':true},from:[{email:s.email}],to:p.to.map((email:string)=>({email})),cc:p.cc.map((email:string)=>({email})),bcc:p.bcc.map((email:string)=>({email})),subject:p.subject,textBody:[{partId:'body',type:'text/plain'}],bodyValues:{body:{value:p.bodyText}},attachments};}
   async draft(s:Session,p:any){const value=await this.draftObject(s,p);
-    if(p.draftId){const [existing]=await this.call(s,[["Email/get",{accountId:s.accountId,ids:[p.draftId],properties:['id','keywords']},'e']]);if(!existing.list?.[0]?.keywords?.['$draft'])throw new AppError('DRAFT_NOT_FOUND',404,'Draft not found.');}
+    if(p.draftId){const [existing]=await this.call(s,[["Email/get",{accountId:s.accountId,ids:[p.draftId],properties:['id','keywords']},'e']]);if(!existing.list?.[0]?.keywords?.['$draft'])throw new AppError('DRAFT_NOT_FOUND',404,'Draft not found.');value.keywords={...existing.list[0].keywords,...value.keywords};}
     const [r]=await this.call(s,[["Email/set",{accountId:s.accountId,create:{draft:value}},'s']]);const newId=r.created?.draft?.id;if(!newId)throw unavailable();
     if(p.draftId){const [removed]=await this.call(s,[["Email/set",{accountId:s.accountId,destroy:[p.draftId]},'d']]);if(removed.notDestroyed?.[p.draftId])throw unavailable();}
     return newId as string;}

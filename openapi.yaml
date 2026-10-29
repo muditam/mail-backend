@@ -84,9 +84,12 @@ paths:
         '200': {description: 'mailboxes array'}
   /messages:
     get:
-      summary: List messages in newest-first order
+      summary: List or search messages in newest-first order
+      description: Supply starred=true for flagged mail across folders, mailboxId to browse a folder, or q to search sender, subject and body across the account. Supplying both restricts search to that folder. Search is limited to 20 requests per session per minute.
       parameters:
-        - {in: query, name: mailboxId, required: true, schema: {type: string}}
+        - {in: query, name: mailboxId, schema: {type: string}}
+        - {in: query, name: starred, schema: {type: string, enum: ['true']}, description: Return only starred messages; can combine with mailboxId and q}
+        - {in: query, name: q, schema: {type: string, minLength: 1, maxLength: 256}, description: Search terms; whitespace-only queries are rejected}
         - {in: query, name: cursor, schema: {type: string}}
         - {in: query, name: limit, schema: {type: integer, minimum: 1, maximum: 100}}
       responses:
@@ -197,3 +200,53 @@ paths:
         '404': {description: Message unavailable in this account}
         '429': {description: Report rate limit exceeded}
         '503': {description: Reporting unavailable or submission status unknown}
+  /messages/{id}/move:
+    post:
+      summary: Move a message to Trash or restore it
+      description: Restore moves drafts to Drafts and other messages to Inbox. Content and keywords are preserved. Repeated operations are harmless. Requires session, same-origin request and CSRF token.
+      parameters:
+        - {in: path, name: id, required: true, schema: {type: string}}
+        - {in: header, name: X-CSRF-Token, required: true, schema: {type: string}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [action]
+              properties:
+                action: {type: string, enum: [trash, restore]}
+      responses:
+        '200': {description: 'message containing id and resulting mailboxIds'}
+        '400': {description: Invalid action or payload}
+        '401': {description: Session expired}
+        '403': {description: Origin or CSRF check failed}
+        '404': {description: Message or destination folder unavailable}
+        '429': {description: Move rate limit exceeded}
+        '503': {description: Move could not be confirmed; refresh before retrying}
+  /messages/{id}/star:
+    patch:
+      summary: Set or clear a message star
+      description: Updates only the JMAP $flagged keyword in the signed-in account. Repeating the same request is harmless.
+      parameters:
+        - {in: path, name: id, required: true, schema: {type: string}}
+        - {in: header, name: X-CSRF-Token, required: true, schema: {type: string}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [isStarred]
+              properties:
+                isStarred: {type: boolean}
+      responses:
+        '200': {description: 'message containing id and isStarred; lists and details expose keywords.$flagged'}
+        '400': {description: Invalid payload}
+        '401': {description: Session expired}
+        '403': {description: Origin or CSRF check failed}
+        '404': {description: Message unavailable in this account}
+        '429': {description: Too many star updates}
+        '503': {description: Update could not be confirmed}
