@@ -22,11 +22,23 @@ export function buildApp(config:Config,store:Store,stalwart:Stalwart):FastifyIns
  app.register(multipart,{limits:{files:1,fileSize:20*1024*1024,fields:0,parts:1}});
  app.setErrorHandler((error,request,reply)=>{let e=error instanceof AppError?error:unavailable();if((error as any).code==='FST_REQ_FILE_TOO_LARGE')e=new AppError('ATTACHMENT_TOO_LARGE',413,'Attachment exceeds 20 MB.');else if((error as any).code==='FST_ERR_CTP_BODY_TOO_LARGE')e=new AppError('INVALID_REQUEST',413,'Request is too large.');request.log.warn({requestId:request.id,route:request.routeOptions.url,code:e.code,status:e.status},'request failed');reply.code(e.status).send({error:{code:e.code,message:e.message,requestId:request.id}});});
  app.addHook('onRequest',async(request,reply)=>{reply.header('Cache-Control','no-store');reply.header('X-Content-Type-Options','nosniff');});
- const session=async(request:FastifyRequest)=>{const sid=cookie(request);const s=sid&&await store.get(sid);if(!s)throw new AppError('SESSION_EXPIRED',401,'Please sign in again.');return s;};
+ const authenticated=new WeakMap<FastifyRequest,Session>();
+ const sessionCookie=(s:Session)=>{
+  // Match the store's sliding idle deadline without extending the absolute lifetime.
+  const deadline=Math.min(s.touchedAt+config.SESSION_IDLE_MINUTES*60000,s.absoluteExpiresAt);
+  return secureCookie(config,s.id,Math.max(0,Math.floor((deadline-Date.now())/1000)));
+ };
+ app.addHook('onSend',async(request,reply,payload)=>{
+  const s=authenticated.get(request);
+  // Failed requests do not renew cookies; explicit login/logout cookies take precedence.
+  if(s&&reply.statusCode>=200&&reply.statusCode<300&&!reply.hasHeader('Set-Cookie'))reply.header('Set-Cookie',sessionCookie(s));
+  return payload;
+ });
+ const session=async(request:FastifyRequest)=>{const sid=cookie(request);const s=sid&&await store.get(sid);if(!s)throw new AppError('SESSION_EXPIRED',401,'Please sign in again.');authenticated.set(request,s);return s;};
  const state=async(request:FastifyRequest)=>{origin(request,config);const s=await session(request);const csrf=request.headers['x-csrf-token'];if(typeof csrf!=='string'||!await store.checkCsrf(s.id,csrf))throw new AppError('CSRF_FAILED',403,'Invalid CSRF token.');return s;};
  app.get('/health',async()=>({status:'ok'}));
  app.get('/ready',async()=>{await store.ready();return {status:'ok'};});
- app.post('/api/app/v1/auth/login',async(request,reply)=>{origin(request,config);const body=parse(login,request.body);const ip=request.ip;throttle(`ip:${ip}`,20,15*60000);throttle(`account:${body.email.toLowerCase()}`,10,15*60000);const {token,accountId}=await stalwart.login(body.email,body.password);const old=cookie(request);if(old)await store.delete(old);const s=await store.create(body.email.toLowerCase(),accountId,token);reply.header('Set-Cookie',secureCookie(config,s.id,config.SESSION_IDLE_MINUTES*60));return {user:{email:s.email},csrfToken:s.csrf};});
+ app.post('/api/app/v1/auth/login',async(request,reply)=>{origin(request,config);const body=parse(login,request.body);const ip=request.ip;throttle(`ip:${ip}`,20,15*60000);throttle(`account:${body.email.toLowerCase()}`,10,15*60000);const {token,accountId}=await stalwart.login(body.email,body.password);const old=cookie(request);if(old)await store.delete(old);const s=await store.create(body.email.toLowerCase(),accountId,token);reply.header('Set-Cookie',sessionCookie(s));return {user:{email:s.email},csrfToken:s.csrf};});
  app.get('/api/app/v1/auth/session',async(request)=>{const s=await session(request);return {user:{email:s.email},csrfToken:await store.rotateCsrf(s.id)};});
  app.post('/api/app/v1/auth/logout',async(request,reply)=>{const s=await state(request);await store.delete(s.id);reply.header('Set-Cookie',secureCookie(config,'',0)).code(204).send();});
  app.get('/api/app/v1/mailboxes',async(request)=>{const s=await session(request);throttle(`mailboxes:${s.id}`,30,60000);return {mailboxes:await stalwart.mailboxes(s)};});

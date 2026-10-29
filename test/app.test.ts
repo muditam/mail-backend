@@ -28,3 +28,71 @@ test('one session cannot hammer mailbox refresh endpoints',async()=>{
   assert.equal(blockedMessages.json().error.code,'RATE_LIMITED');
  }finally{await x.close();}
 });
+
+test('browser session slides during activity but respects idle, absolute expiry and revocation',async(t)=>{
+ const x=await setup();
+ let now=Date.now();
+ t.mock.method(Date,'now',()=>now);
+ const minute=60000;
+ let browserCookie='',cookieDeadline=0;
+ const acceptCookie=(value:unknown)=>{
+  assert.equal(typeof value,'string');
+  const header=value as string;
+  assert.match(header,/HttpOnly; SameSite=Lax/);
+  browserCookie=header.split(';')[0];
+  cookieDeadline=now+Number(/Max-Age=(\d+)/.exec(header)![1])*1000;
+ };
+ const signIn=async()=>{
+  const r=await x.app.inject({method:'POST',url:'/api/app/v1/auth/login',headers:origin,payload:{email:'active@example.test',password:'correct'}});
+  assert.equal(r.statusCode,200);
+  acceptCookie(r.headers['set-cookie']);
+  return r.json().csrfToken as string;
+ };
+ const boxes=()=>x.app.inject({method:'GET',url:'/api/app/v1/mailboxes',headers:{cookie:now<cookieDeadline?browserCookie:''}});
+ try{
+  await signIn();
+  const start=now;
+  assert.equal(cookieDeadline,start+30*minute);
+  // Model browser expiry, not just Fastify injection with an immortal cookie.
+  for(let elapsed=20;elapsed<720;elapsed+=20){
+   now=start+elapsed*minute;
+   const r=await boxes();
+   assert.equal(r.statusCode,200,`active session at minute ${elapsed}`);
+   acceptCookie(r.headers['set-cookie']);
+   assert.equal(cookieDeadline,Math.min(now+30*minute,start+720*minute));
+  }
+  const originalCookie=browserCookie;
+  now=start+720*minute;
+  assert.equal((await boxes()).statusCode,401);
+  // Absolute expiry is enforced server-side even if the client keeps the cookie.
+  const absolute=await x.app.inject({method:'GET',url:'/api/app/v1/mailboxes',headers:{cookie:originalCookie}});
+  assert.equal(absolute.statusCode,401);
+  assert.equal(absolute.headers['set-cookie'],undefined);
+
+  await signIn();
+  const idleCookie=browserCookie;
+  now+=30*minute;
+  const idle=await x.app.inject({method:'GET',url:'/api/app/v1/mailboxes',headers:{cookie:idleCookie}});
+  assert.equal(idle.statusCode,401);
+  assert.equal(idle.headers['set-cookie'],undefined);
+
+  const csrf=await signIn();
+  const forbidden=await x.app.inject({method:'POST',url:'/api/app/v1/auth/logout',headers:{...origin,cookie:browserCookie,'x-csrf-token':'wrong'}});
+  assert.equal(forbidden.statusCode,403);
+  assert.equal(forbidden.headers['set-cookie'],undefined);
+  const failed=await x.app.inject({method:'POST',url:'/api/app/v1/messages/send',headers:{...origin,cookie:browserCookie,'x-csrf-token':csrf},payload:{to:['b@example.test'],subject:'Hi',bodyText:'Hello',attachmentIds:[]}});
+  assert.equal(failed.statusCode,503);
+  assert.equal(failed.headers['set-cookie'],undefined);
+  const out=await x.app.inject({method:'POST',url:'/api/app/v1/auth/logout',headers:{...origin,cookie:browserCookie,'x-csrf-token':csrf}});
+  assert.equal(out.statusCode,204);
+  assert.match(out.headers['set-cookie'] as string,/webmail_sid=;.*Max-Age=0/);
+  assert.equal((await boxes()).statusCode,401);
+
+  await signIn();
+  await x.store.delete(browserCookie.slice('webmail_sid='.length));
+  assert.equal((await boxes()).statusCode,401);
+ }finally{
+  t.mock.restoreAll();
+  await x.close();
+ }
+});
