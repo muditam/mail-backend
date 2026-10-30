@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, createHash } from 'node:crypto';
 import { MongoClient } from 'mongodb';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import { Store } from '../src/store.js';
@@ -31,6 +31,21 @@ test('MongoDB keeps encrypted sessions across backend restarts and reserves send
       assert.equal(JSON.stringify(raw).includes('sensitive-access-token'), false);
       assert.equal(JSON.stringify(raw).includes('sensitive-refresh-token'), false);
       assert.notEqual(raw._id, session.id);
+      // Simulate a pre-upgrade session whose current CSRF token was random.
+      const legacy = await store.create('legacy@example.test', 'legacy-account', session.token);
+      const legacyToken = 'existing-tab-random-csrf';
+      await rawClient.db(config.MONGODB_DB_NAME).collection('sessions').updateOne(
+        { _id: createHash('sha256').update(legacy.id).digest('hex') as any },
+        { $set: { csrfHash: createHash('sha256').update(legacyToken).digest('hex') } },
+      );
+      const stableToken = store.csrfToken(legacy.id);
+      assert.equal(await store.checkCsrf(legacy.id, legacyToken), true);
+      assert.equal(await store.checkCsrf(legacy.id, stableToken), true);
+      assert.equal(await store.checkCsrf(legacy.id, 'incorrect'), false);
+      await store.delete(legacy.id);
+      assert.equal(await store.checkCsrf(legacy.id, legacyToken), false);
+      assert.equal(await store.checkCsrf(legacy.id, stableToken), false);
+
     } finally { await rawClient.close(); }
 
     await store.close();
@@ -39,9 +54,13 @@ test('MongoDB keeps encrypted sessions across backend restarts and reserves send
     assert.equal(restored?.email, 'a@example.test');
     assert.equal(restored?.token.refresh_token, 'sensitive-refresh-token');
     assert.equal(await store.checkCsrf(session.id, session.csrf), true);
-    const rotated = await store.rotateCsrf(session.id);
-    assert.equal(await store.checkCsrf(session.id, session.csrf), false);
-    assert.equal(await store.checkCsrf(session.id, rotated), true);
+    const restoredCsrf = store.csrfToken(session.id);
+    assert.equal(restoredCsrf, session.csrf);
+    assert.equal(await store.checkCsrf(session.id, restoredCsrf), true);
+    assert.equal(await store.checkCsrf(session.id, 'wrong'), false);
+    const other = await store.create('b@example.test', 'account-b', session.token);
+    assert.notEqual(other.csrf, session.csrf);
+    assert.equal(await store.checkCsrf(other.id, session.csrf), false);
 
     const upload = await store.addUpload(session.id, 'stalwart-blob', 'file.txt', 'text/plain', 10);
     assert.equal((await store.getUpload(session.id, upload.id))?.blobId, 'stalwart-blob');

@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, randomBytes, createHash } from 'node:crypto';
+import { createCipheriv, createDecipheriv, randomBytes, createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import { MongoClient, MongoServerError, type Collection, type Db } from 'mongodb';
 import type { Config } from './config.js';
 
@@ -57,7 +57,7 @@ export class Store {
   }
 
   async create(email: string, accountId: string, token: Token): Promise<Session> {
-    const now = Date.now(), id = randomBytes(32).toString('base64url'), csrf = randomBytes(32).toString('base64url');
+    const now = Date.now(), id = randomBytes(32).toString('base64url'), csrf = this.csrfToken(id);
     const end = now + this.config.SESSION_ABSOLUTE_HOURS * 3600000;
     await this.sessions.insertOne({ _id: hash(id), email, accountId, csrfHash: hash(csrf), tokenCipher: this.seal(token), createdAt: now, touchedAt: now, absoluteExpiresAt: end, expireAt: new Date(end) });
     return { id, email, accountId, csrf, token, createdAt: now, touchedAt: now, absoluteExpiresAt: end };
@@ -71,13 +71,20 @@ export class Store {
     if (!row) return undefined;
     return { id, email: row.email, accountId: row.accountId, csrf: '', token: this.open(row.tokenCipher), createdAt: row.createdAt, touchedAt: row.touchedAt, absoluteExpiresAt: row.absoluteExpiresAt };
   }
-  async rotateCsrf(id: string): Promise<string> {
-    const csrf = randomBytes(32).toString('base64url');
-    await this.sessions.updateOne({ _id: hash(id) }, { $set: { csrfHash: hash(csrf) } });
-    return csrf;
+  csrfToken(id: string): string {
+    // Session-bound and stable across tabs, restores and backend instances.
+    // Domain separation keeps this derivation distinct from token encryption.
+    return createHmac('sha256', this.key).update('webmail:csrf:v1\0').update(id).digest('base64url');
   }
   async checkCsrf(id: string, csrf: string): Promise<boolean> {
-    return !!(await this.sessions.findOne({ _id: hash(id), csrfHash: hash(csrf) }, { projection: { _id: 1 } }));
+    const now = Date.now();
+    const row = await this.sessions.findOne({ _id: hash(id), absoluteExpiresAt: { $gt: now }, touchedAt: { $gt: now - this.config.SESSION_IDLE_MINUTES * 60000 } });
+    if (!row) return false;
+    const candidate = Buffer.from(hash(csrf), 'hex');
+    const stable = Buffer.from(hash(this.csrfToken(id)), 'hex');
+    // Keep an existing session's last legacy token valid during rollout. Restores
+    // never replace it; new sessions use only their stable token.
+    return timingSafeEqual(candidate, stable) || timingSafeEqual(candidate, Buffer.from(row.csrfHash, 'hex'));
   }
   async updateToken(id: string, token: Token) {
     await this.sessions.updateOne({ _id: hash(id) }, { $set: { tokenCipher: this.seal(token) } });
