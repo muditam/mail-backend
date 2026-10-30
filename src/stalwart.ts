@@ -55,8 +55,13 @@ export class Stalwart {
     const match=search?{operator:'OR',conditions:[{from:search},{subject:search},{body:search}]}:undefined;
     const conditions=[...(mailboxId?[{inMailbox:mailboxId}]:[]),...(match?[match]:[]),...(starred?[{hasKeyword:'$flagged'}]:[])];
     const filter=conditions.length>1?{operator:'AND',conditions}:conditions[0];
-    const [query]=await this.call(s,[['Email/query',{accountId:s.accountId,filter,sort:[{property:'receivedAt',isAscending:false}],position:cursor,limit:limit+1},'q']]);const ids=(query.ids||[]).slice(0,limit);if(!ids.length)return {messages:[]};
-    const [get]=await this.call(s,[['Email/get',{accountId:s.accountId,ids,properties:['id','mailboxIds','from','to','subject','preview','receivedAt','keywords','attachments']},'e']]);const byId=new Map((get.list||[]).map((m:any)=>[m.id,m]));return {messages:ids.map((id:string)=>this.summary(byId.get(id))).filter(Boolean),nextCursor:query.ids.length>limit?String(cursor+limit):undefined};
+    const [query]=await this.call(s,[['Email/query',{accountId:s.accountId,filter,sort:[{property:'receivedAt',isAscending:false}],position:cursor,limit:limit+1},'q']]);if(!Array.isArray(query?.ids)||query.ids.some((id:unknown)=>typeof id!=='string'||!id))throw unavailable();
+    const ids=query.ids.slice(0,limit);if(!ids.length)return {messages:[]};
+    const [get]=await this.call(s,[['Email/get',{accountId:s.accountId,ids,properties:['id','mailboxIds','from','to','subject','preview','receivedAt','keywords','attachments']},'e']]);if(!Array.isArray(get?.list)||get.list.some((m:any)=>!m||typeof m.id!=='string'))throw unavailable();
+    const byId=new Map(get.list.map((m:any)=>[m.id,m]));
+    // Only explicitly vanished messages may be absent between query and retrieval.
+    if(ids.some((id:string)=>!byId.has(id)&&!get.notFound?.includes(id)))throw unavailable();
+    return {messages:ids.map((id:string)=>this.summary(byId.get(id))).filter(Boolean),nextCursor:query.ids.length>limit?String(cursor+limit):undefined};
   }
   private summary(m:any){if(!m)return null;return {safety:classifySafety(m,this.config),id:m.id,mailboxIds:Object.keys(m.mailboxIds||{}),from:m.from||[],to:m.to||[],subject:m.subject||'',preview:m.preview||'',receivedAt:m.receivedAt||new Date(0).toISOString(),isRead:!!m.keywords?.['$seen'],hasAttachment:!!m.attachments?.length,keywords:m.keywords||{}};}
   async message(s:Session,id:string){const [r]=await this.call(s,[['Email/get',{accountId:s.accountId,ids:[id],properties:['id','mailboxIds','from','to','cc','bcc','subject','preview','receivedAt','keywords','attachments','textBody','bodyValues'] ,fetchTextBodyValues:true},'e']]);const m=r.list?.[0];if(!m)throw new AppError('MESSAGE_NOT_FOUND',404,'Message not found.');const body=(m.textBody||[]).map((p:any)=>m.bodyValues?.[p.partId]?.value||'').join('\n');const attachments=await Promise.all((m.attachments||[]).map(async(a:any)=>{const up=await this.store.addUpload(s.id,a.blobId,attachmentName(a.name,a.type),a.type||'application/octet-stream',a.size||0);return {id:up.id,name:up.name,type:up.type,size:up.size};}));return {...this.summary(m),cc:m.cc||[],bcc:m.bcc||[],bodyText:body,attachments};}
@@ -86,12 +91,18 @@ export class Stalwart {
     const current=Object.keys(message.mailboxIds||{});
     // Repeated requests are harmless, including a restore retried after success.
     if(action==='restore'&&!current.includes(trash.id))return {id,mailboxIds:current};
-    const role=action==='trash'?'trash':message.keywords?.['$draft']?'drafts':'inbox';
+    const sentOrigin='muditam-restore-sent';
+    const role=action==='trash'?'trash':message.keywords?.['$draft']?'drafts':message.keywords?.[sentOrigin]?'sent':'inbox';
     const destination=boxes.find((box:any)=>box.role===role);
     if(!destination)throw new AppError('MAILBOX_NOT_FOUND',404,`The ${role} folder is unavailable.`);
     if(current.length===1&&current[0]===destination.id)return {id,mailboxIds:current};
-    // Replace membership atomically, leaving content, attachments and keywords intact.
-    const [updated]=await this.call(s,[['Email/set',{accountId:s.accountId,ifInState:result.state,update:{[id]:{mailboxIds:{[destination.id]:true}}}},'u']]);
+    // Record Sent origin atomically with the move, independent of the login session.
+    // Patch only our marker, preserving read/star and other user keywords.
+    const patch:Record<string,unknown>={mailboxIds:{[destination.id]:true}};
+    const fromSent=boxes.some((box:any)=>box.role==='sent'&&current.includes(box.id));
+    if(action==='trash'&&fromSent)patch[`keywords/${sentOrigin}`]=true;
+    else if(message.keywords?.[sentOrigin])patch[`keywords/${sentOrigin}`]=null;
+    const [updated]=await this.call(s,[['Email/set',{accountId:s.accountId,ifInState:result.state,update:{[id]:patch}},'u']]);
     const failure=updated.notUpdated?.[id];
     if(failure?.type==='notFound')throw new AppError('MESSAGE_NOT_FOUND',404,'Message not found.');
     if(failure||!Object.prototype.hasOwnProperty.call(updated.updated||{},id))throw unavailable();

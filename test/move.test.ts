@@ -24,9 +24,9 @@ function fixture(){
    else if(method==='Email/set'){
     assert.equal(args.ifInState,'state-1');
     assert.deepEqual(Object.keys(args),['accountId','ifInState','update']);
-    assert.deepEqual(Object.keys(args.update.E1),['mailboxIds']);
+    assert.ok(Object.keys(args.update.E1).every(key=>key==='mailboxIds'||key==='keywords/muditam-restore-sent'));
     result=setResult??{updated:{E1:null}};
-    if(result.updated?.E1===null)message.mailboxIds=args.update.E1.mailboxIds;
+    if(result.updated?.E1===null){message.mailboxIds=args.update.E1.mailboxIds;const marker=args.update.E1['keywords/muditam-restore-sent'];if(marker===true)message.keywords['muditam-restore-sent']=true;else if(marker===null)delete message.keywords['muditam-restore-sent'];}
    }else throw Error('Unexpected JMAP method '+method);
    body={methodResponses:[[method,result,tag]]};
   }
@@ -42,13 +42,16 @@ test('trash and restore preserve content and keywords, use actual mailbox roles 
   const x=fixture();x.message.mailboxIds=source;
   const original=structuredClone(x.message);
   assert.deepEqual(await x.adapter.moveMessage(x.session,'E1','trash'),{id:'E1',mailboxIds:['box-trash']});
-  assert.deepEqual(x.message,{...original,mailboxIds:{'box-trash':true}});
+  assert.deepEqual(x.message,{...original,mailboxIds:{'box-trash':true},keywords:{...original.keywords,...(source['box-sent']?{'muditam-restore-sent':true}:{})}});
   await x.adapter.moveMessage(x.session,'E1','trash');
   assert.equal(x.calls.filter(c=>c.method==='Email/set').length,1);
-  assert.deepEqual(await x.adapter.moveMessage(x.session,'E1','restore'),{id:'E1',mailboxIds:['box-in']});
+  const destination=source['box-sent']?'box-sent':'box-in';
+  // Use a fresh adapter and session to prove restore does not rely on process/session memory.
+  const fresh=new Stalwart(x.config,x.store,(x.adapter as any).fetcher);
+  assert.deepEqual(await fresh.moveMessage({...x.session,id:'new-login'},'E1','restore'),{id:'E1',mailboxIds:[destination]});
   await x.adapter.moveMessage(x.session,'E1','restore');
   assert.equal(x.calls.filter(c=>c.method==='Email/set').length,2);
-  assert.deepEqual(x.message,{...original,mailboxIds:{'box-in':true}});
+  assert.deepEqual(x.message,{...original,mailboxIds:{[destination]:true}});
  }
 });
 test('drafts restore to Drafts and a restore outside Trash leaves membership untouched',async()=>{
@@ -96,4 +99,38 @@ test('authenticated HTTP flow moves and restores with fresh folder lists and cou
   assert.equal((await list('box-trash')).length,0);assert.equal((await list('box-in')).length,1);
   x.fail({notUpdated:{E1:{type:'forbidden'}}});assert.equal((await move('trash')).statusCode,503);
  }finally{await app.close();}
+});
+
+test('Sent provenance survives re-login, preserves unread/star state and updates counts',async()=>{
+ const x=fixture();x.message.mailboxIds={'box-sent':true};delete x.message.keywords['$seen'];
+ const before=structuredClone(x.message);
+ await x.adapter.moveMessage(x.session,'E1','trash');
+ assert.equal(x.message.keywords['muditam-restore-sent'],true);
+ const renewed={...x.session,id:'renewed-session'};
+ const fresh=new Stalwart(x.config,x.store,(x.adapter as any).fetcher);
+ assert.equal((await fresh.messages(renewed,'box-sent',0,30)).messages.length,0);
+ assert.equal((await fresh.messages(renewed,'box-trash',0,30)).messages.length,1);
+ await fresh.moveMessage(renewed,'E1','restore');
+ assert.deepEqual(x.message,before);
+ assert.equal((await fresh.messages(renewed,'box-in',0,30)).messages.length,0);
+ assert.equal((await fresh.messages(renewed,'box-trash',0,30)).messages.length,0);
+ assert.equal((await fresh.messages(renewed,'box-sent',0,30)).messages.length,1);
+ const counts=await fresh.mailboxes(renewed);
+ assert.equal(counts.find((b:any)=>b.role==='sent').totalCount,1);
+ assert.equal(counts.find((b:any)=>b.role==='sent').unreadCount,1);
+ assert.equal(counts.find((b:any)=>b.role==='trash').totalCount,0);
+ // A later move from Inbox must not retain stale Sent provenance.
+ x.message.mailboxIds={'box-in':true};
+ await fresh.moveMessage(renewed,'E1','trash');await fresh.moveMessage(renewed,'E1','restore');
+ assert.deepEqual(x.message.mailboxIds,{'box-in':true});
+});
+test('missing Sent folder or rejected restore leaves the message and origin marker in Trash',async()=>{
+ const x=fixture();x.message.mailboxIds={'box-sent':true};
+ await x.adapter.moveMessage(x.session,'E1','trash');const trashed=structuredClone(x.message);
+ x.fail({notUpdated:{E1:{type:'forbidden'}}});
+ await assert.rejects(x.adapter.moveMessage(x.session,'E1','restore'));
+ assert.deepEqual(x.message,trashed);
+ x.boxes.splice(x.boxes.findIndex(b=>b.role==='sent'),1);
+ await assert.rejects(x.adapter.moveMessage(x.session,'E1','restore'),{code:'MAILBOX_NOT_FOUND'});
+ assert.deepEqual(x.message,trashed);
 });
