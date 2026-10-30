@@ -86,12 +86,18 @@ export class Stalwart {
     const current=Object.keys(message.mailboxIds||{});
     // Repeated requests are harmless, including a restore retried after success.
     if(action==='restore'&&!current.includes(trash.id))return {id,mailboxIds:current};
-    const role=action==='trash'?'trash':message.keywords?.['$draft']?'drafts':'inbox';
+    const sentOrigin='muditam-restore-sent';
+    const role=action==='trash'?'trash':message.keywords?.['$draft']?'drafts':message.keywords?.[sentOrigin]?'sent':'inbox';
     const destination=boxes.find((box:any)=>box.role===role);
     if(!destination)throw new AppError('MAILBOX_NOT_FOUND',404,`The ${role} folder is unavailable.`);
     if(current.length===1&&current[0]===destination.id)return {id,mailboxIds:current};
-    // Replace membership atomically, leaving content, attachments and keywords intact.
-    const [updated]=await this.call(s,[['Email/set',{accountId:s.accountId,ifInState:result.state,update:{[id]:{mailboxIds:{[destination.id]:true}}}},'u']]);
+    // Record Sent origin atomically with the move, independent of the login session.
+    // Patch only our marker, preserving read/star and other user keywords.
+    const patch:Record<string,unknown>={mailboxIds:{[destination.id]:true}};
+    const fromSent=boxes.some((box:any)=>box.role==='sent'&&current.includes(box.id));
+    if(action==='trash'&&fromSent)patch[`keywords/${sentOrigin}`]=true;
+    else if(message.keywords?.[sentOrigin])patch[`keywords/${sentOrigin}`]=null;
+    const [updated]=await this.call(s,[['Email/set',{accountId:s.accountId,ifInState:result.state,update:{[id]:patch}},'u']]);
     const failure=updated.notUpdated?.[id];
     if(failure?.type==='notFound')throw new AppError('MESSAGE_NOT_FOUND',404,'Message not found.');
     if(failure||!Object.prototype.hasOwnProperty.call(updated.updated||{},id))throw unavailable();
