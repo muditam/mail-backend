@@ -1,3 +1,4 @@
+import {submissionOutcome} from './retries.js';
 import {attachmentName} from './attachmentName.js';
 import { classifySafety } from './safety.js';
 import { createHash, randomBytes } from 'node:crypto';
@@ -61,10 +62,11 @@ export class Stalwart {
     const byId=new Map(get.list.map((m:any)=>[m.id,m]));
     // Only explicitly vanished messages may be absent between query and retrieval.
     if(ids.some((id:string)=>!byId.has(id)&&!get.notFound?.includes(id)))throw unavailable();
-    return {messages:ids.map((id:string)=>this.summary(byId.get(id))).filter(Boolean),nextCursor:query.ids.length>limit?String(cursor+limit):undefined};
+    const retries=await this.store.retries?.summaries(s.accountId,ids);
+    return {messages:ids.map((id:string)=>({...this.summary(byId.get(id)),...(retries?.has(id)?{deliveryRetry:retries.get(id)}:{})})).filter((m:any)=>m.id),nextCursor:query.ids.length>limit?String(cursor+limit):undefined};
   }
   private summary(m:any){if(!m)return null;return {safety:classifySafety(m,this.config),id:m.id,mailboxIds:Object.keys(m.mailboxIds||{}),from:m.from||[],to:m.to||[],subject:m.subject||'',preview:m.preview||'',receivedAt:m.receivedAt||new Date(0).toISOString(),isRead:!!m.keywords?.['$seen'],hasAttachment:!!m.attachments?.length,keywords:m.keywords||{}};}
-  async message(s:Session,id:string){const [r]=await this.call(s,[['Email/get',{accountId:s.accountId,ids:[id],properties:['id','mailboxIds','from','to','cc','bcc','subject','preview','receivedAt','keywords','attachments','textBody','bodyValues'] ,fetchTextBodyValues:true},'e']]);const m=r.list?.[0];if(!m)throw new AppError('MESSAGE_NOT_FOUND',404,'Message not found.');const body=(m.textBody||[]).map((p:any)=>m.bodyValues?.[p.partId]?.value||'').join('\n');const attachments=await Promise.all((m.attachments||[]).map(async(a:any)=>{const up=await this.store.addUpload(s.id,a.blobId,attachmentName(a.name,a.type),a.type||'application/octet-stream',a.size||0);return {id:up.id,name:up.name,type:up.type,size:up.size};}));return {...this.summary(m),cc:m.cc||[],bcc:m.bcc||[],bodyText:body,attachments};}
+  async message(s:Session,id:string){const [r]=await this.call(s,[['Email/get',{accountId:s.accountId,ids:[id],properties:['id','mailboxIds','from','to','cc','bcc','subject','preview','receivedAt','keywords','attachments','textBody','bodyValues'] ,fetchTextBodyValues:true},'e']]);const m=r.list?.[0];if(!m)throw new AppError('MESSAGE_NOT_FOUND',404,'Message not found.');const body=(m.textBody||[]).map((p:any)=>m.bodyValues?.[p.partId]?.value||'').join('\n');const attachments=await Promise.all((m.attachments||[]).map(async(a:any)=>{const up=await this.store.addUpload(s.id,a.blobId,attachmentName(a.name,a.type),a.type||'application/octet-stream',a.size||0);return {id:up.id,name:up.name,type:up.type,size:up.size};}));const retry=await this.store.retries?.get(s.accountId,id);return {...this.summary(m),...(retry?{deliveryRetry:this.store.retries.summary(retry)}:{}),cc:m.cc||[],bcc:m.bcc||[],bodyText:body,attachments};}
   async report(s:Session,id:string){
     if(!this.config.IT_REPORT_EMAIL)throw new AppError('REPORT_UNAVAILABLE',503,'IT reporting is not configured.');
     const [r]=await this.call(s,[['Email/get',{accountId:s.accountId,ids:[id],properties:['id','from','subject','receivedAt']},'e']]);
@@ -82,6 +84,7 @@ export class Stalwart {
     return {id,isStarred};
   }
   async moveMessage(s:Session,id:string,action:'trash'|'restore'){
+    await this.assertNotRetrying(s,id,true);
     const boxes=await this.mailboxes(s);
     const trash=boxes.find((box:any)=>box.role==='trash');
     if(!trash)throw new AppError('MAILBOX_NOT_FOUND',404,'Trash folder is unavailable.');
@@ -112,14 +115,119 @@ export class Stalwart {
   async download(s:Session,id:string){const up=await this.store.getUpload(s.id,id);if(!up)throw new AppError('ATTACHMENT_NOT_FOUND',404,'Attachment not found.');const {access,session}=await this.context(s);const url=this.safeUrl(session.downloadUrl.replace('{accountId}',encodeURIComponent(s.accountId)).replace('{blobId}',encodeURIComponent(up.blobId)).replace('{name}',encodeURIComponent(up.name)).replace('{type}',encodeURIComponent(up.type)));let r:Response;try{r=await this.fetcher(url,{headers:{authorization:`Bearer ${access}`},signal:timeout(30000)});}catch{throw unavailable();}if(!r.ok||!r.body)throw unavailable();return {body:r.body,name:up.name,type:up.type};}
   private async draftMailbox(s:Session){const boxes=await this.mailboxes(s);const box=boxes.find((x:any)=>x.role==='drafts');if(!box)throw unavailable();return box.id as string;}
   private async draftObject(s:Session,p:any){const box=await this.draftMailbox(s);const attachments=await Promise.all(p.attachmentIds.map(async(id:string)=>{const up=await this.store.getUpload(s.id,id);if(!up)throw new AppError('ATTACHMENT_NOT_FOUND',404,'Attachment not found.');return {blobId:up.blobId,type:up.type,name:up.name,size:up.size};}));return {mailboxIds:{[box]:true},keywords:{'$draft':true,'$seen':true},from:[{email:s.email}],to:p.to.map((email:string)=>({email})),cc:p.cc.map((email:string)=>({email})),bcc:p.bcc.map((email:string)=>({email})),subject:p.subject,textBody:[{partId:'body',type:'text/plain'}],bodyValues:{body:{value:p.bodyText}},attachments};}
-  async draft(s:Session,p:any){const value=await this.draftObject(s,p);
+  async draft(s:Session,p:any){if(p.draftId)await this.assertNotRetrying(s,p.draftId);const value=await this.draftObject(s,p);
     if(p.draftId){const [existing]=await this.call(s,[["Email/get",{accountId:s.accountId,ids:[p.draftId],properties:['id','keywords']},'e']]);if(!existing.list?.[0]?.keywords?.['$draft'])throw new AppError('DRAFT_NOT_FOUND',404,'Draft not found.');value.keywords={...existing.list[0].keywords,...value.keywords};}
     const [r]=await this.call(s,[["Email/set",{accountId:s.accountId,create:{draft:value}},'s']]);const newId=r.created?.draft?.id;if(!newId)throw unavailable();
     if(p.draftId){const [removed]=await this.call(s,[["Email/set",{accountId:s.accountId,destroy:[p.draftId]},'d']]);if(removed.notDestroyed?.[p.draftId])throw unavailable();}
     return newId as string;}
-  async deleteDraft(s:Session,id:string){const [existing]=await this.call(s,[['Email/get',{accountId:s.accountId,ids:[id],properties:['id','keywords']},'e']]);if(!existing.list?.[0]?.keywords?.['$draft'])throw new AppError('DRAFT_NOT_FOUND',404,'Draft not found.');const [r]=await this.call(s,[['Email/set',{accountId:s.accountId,destroy:[id]},'d']]);if(r.notDestroyed?.[id])throw unavailable();}
-  async send(s:Session,p:any){const id=await this.draft(s,p);const boxes=await this.mailboxes(s);const draftBox=boxes.find((x:any)=>x.role==='drafts')?.id;const sentBox=boxes.find((x:any)=>x.role==='sent')?.id;if(!draftBox||!sentBox)throw new AppError('SEND_REJECTED',422,'Required mailboxes are unavailable.');
-    const [identity]=await this.call(s,[["Identity/get",{accountId:s.accountId},'i']],true);const sender=(identity.list||[]).find((x:any)=>String(x.email).toLowerCase()===s.email.toLowerCase());if(!sender)throw new AppError('SEND_REJECTED',422,'No sending identity is available for this account.');
-    const digest=createHash('sha256').update(JSON.stringify(p)).digest('hex');if(!await this.store.reserveSend(s.id,digest))throw new AppError('SEND_STATUS_UNKNOWN',409,'This message was already submitted or its status is unknown. Check Sent before retrying.');
-    const [r]=await this.call(s,[["EmailSubmission/set",{accountId:s.accountId,create:{send:{emailId:id,identityId:sender.id}},onSuccessUpdateEmail:{'#send':{[`mailboxIds/${draftBox}`]:null,[`mailboxIds/${sentBox}`]:true,'keywords/$draft':null}}},'s']],true);const submissionId=r.created?.send?.id;if(!submissionId){await this.store.releaseSend(s.id,digest);throw new AppError('SEND_REJECTED',422,'Mail server rejected the message.');}await this.store.acceptSend(s.id,digest,submissionId);return submissionId as string;}
+  async deleteDraft(s:Session,id:string){await this.assertNotRetrying(s,id);const [existing]=await this.call(s,[['Email/get',{accountId:s.accountId,ids:[id],properties:['id','keywords']},'e']]);if(!existing.list?.[0]?.keywords?.['$draft'])throw new AppError('DRAFT_NOT_FOUND',404,'Draft not found.');const [r]=await this.call(s,[['Email/set',{accountId:s.accountId,destroy:[id]},'d']]);if(r.notDestroyed?.[id])throw unavailable();}
+  private async assertNotRetrying(s:Session,id:string,activeOnly=false){
+    const job=await this.store.retries?.get(s.accountId,id);
+    if(job&&(!activeOnly||['waiting','working','dispatching'].includes(job.state)))throw new AppError('SEND_MANAGED',409,'This message has an automatic delivery record. Open its delivery status instead of editing or resending it.');
+  }
+  private async moveSubmittedToSent(s:Session,id:string,draftBox:string,sentBox:string){
+    try{
+      const [updated]=await this.call(s,[["Email/set",{accountId:s.accountId,update:{[id]:{[`mailboxIds/${draftBox}`]:null,[`mailboxIds/${sentBox}`]:true,'keywords/$draft':null}}},'sent']]);
+      if(updated.notUpdated?.[id]||!Object.prototype.hasOwnProperty.call(updated.updated||{},id))throw unavailable();
+    }catch{throw new AppError('SEND_STATUS_UNKNOWN',503,'Submission may have succeeded but its folder could not be updated. Do not resend.');}
+  }
+  async retryOne(now=Date.now()):Promise<boolean>{
+    const queue=this.store.retries,job=await queue.claim(now);
+    if(!job)return false;
+    try{
+      let token=queue.token(job);
+      if(token.expires_at<Date.now()+90_000){
+        if(!token.refresh_token)throw Error('Retry authorization expired');
+        const r=await this.json(this.config.STALWART_TOKEN_URL,{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body:new URLSearchParams({grant_type:'refresh_token',refresh_token:token.refresh_token,client_id:this.config.OAUTH_CLIENT_ID})});
+        if(r.status!==200||typeof r.body?.access_token!=='string')throw Error('Retry authorization expired');
+        token={access_token:r.body.access_token,refresh_token:r.body.refresh_token||token.refresh_token,expires_at:Date.now()+Math.max(1,Number(r.body.expires_in)||3600)*1000};
+        if(!await queue.saveToken(job,token))return true;
+      }
+      if(token.expires_at<Date.now()+90_000)throw Error('Retry token lifetime too short');
+      const session:Session={id:'',email:job.sender,accountId:job.accountId,csrf:'',token,createdAt:now,touchedAt:now,absoluteExpiresAt:job.deadline};
+      const [email]=await this.call(session,[["Email/get",{accountId:job.accountId,ids:[job.emailId],properties:['id']},'exists']]);
+      if(!email.list?.some((value:any)=>value.id===job.emailId))throw Error('Original email unavailable');
+      // Persist an irreversible dispatch marker before contacting Stalwart.
+      // Expired/stale claim holders cannot start another network submission.
+      if(!await queue.dispatch(job))return true;
+      const [created]=await this.call(session,[["EmailSubmission/set",{accountId:job.accountId,create:{retry:{emailId:job.emailId,identityId:job.identityId,envelope:{mailFrom:{email:job.sender},rcptTo:job.recipients.map(email=>({email}))}}}},'retry']],true);
+      const id=created.created?.retry?.id;
+      if(typeof id!=='string'){
+        if(created.notCreated?.retry)await queue.finish(job,job.submissionId,{retry:[],accepted:0,failed:job.recipients.length},now);
+        else await queue.attention(job,'unknown-submission',now);
+        return true;
+      }
+      if(!await queue.recordSubmission(job,id))return true;
+      const [get]=await this.call(session,[["EmailSubmission/get",{accountId:job.accountId,ids:[id]},'status']],true);
+      const submission=get.list?.find((value:any)=>value.id===id&&value.emailId===job.emailId);
+      const outcome=submissionOutcome(submission,job.recipients);
+      if(!outcome){await queue.attention(job,'unknown-status',now);return true;}
+      // Persist the recipient reduction before any cosmetic folder changes.
+      await queue.finish(job,id,outcome,now);
+      if(outcome.accepted){
+        const boxes=await this.mailboxes(session),draft=boxes.find((b:any)=>b.role==='drafts'),sent=boxes.find((b:any)=>b.role==='sent');
+        if(draft&&sent)await this.moveSubmittedToSent(session,job.emailId,draft.id,sent.id);
+      }
+    }catch{
+      // No blind re-send after a timeout, crash, token failure or uncertain write.
+      await queue.attention(job,'needs-review',now);
+    }
+    return true;
+  }
+  async send(s:Session,p:any){
+    const boxes=await this.mailboxes(s);
+    const draftBox=boxes.find((x:any)=>x.role==='drafts')?.id,sentBox=boxes.find((x:any)=>x.role==='sent')?.id;
+    if(!draftBox||!sentBox)throw new AppError('SEND_REJECTED',422,'Required mailboxes are unavailable.');
+    const [identity]=await this.call(s,[["Identity/get",{accountId:s.accountId},'i']],true);
+    const sender=(identity.list||[]).find((x:any)=>String(x.email).toLowerCase()===s.email.toLowerCase());
+    if(!sender)throw new AppError('SEND_REJECTED',422,'No sending identity is available for this account.');
+    const uncertain=()=>new AppError('SEND_STATUS_UNKNOWN',503,'Could not confirm send. Check Sent and Drafts before retrying; the message may already have been submitted.');
+    const digest=createHash('sha256').update(JSON.stringify(p)).digest('hex');
+    if(!await this.store.reserveSend(s.id,digest))throw uncertain();
+    let id:string;
+    try{id=await this.draft(s,p);}catch(error){await this.store.releaseSend(s.id,digest);throw error;}
+    // Creation of a submission does not mean its recipients were accepted.
+    // Do not let onSuccessUpdateEmail move a rejected submission into Sent.
+    let result:any;
+    try{[result]=await this.call(s,[["EmailSubmission/set",{accountId:s.accountId,create:{send:{emailId:id,identityId:sender.id}}},'s']],true);}
+    catch{throw uncertain();} // Keep the duplicate guard after ambiguous network/provider failures.
+    const submissionId=result.created?.send?.id;
+    if(typeof submissionId!=='string'||!submissionId){
+      if(result.notCreated?.send){
+        await this.store.releaseSend(s.id,digest);
+        throw new AppError('SEND_REJECTED',422,'Mail server rejected the message. Your message remains in Drafts.',{draftId:id});
+      }
+      throw uncertain();
+    }
+    await this.store.acceptSend(s.id,digest,submissionId);
+    let submission:any;
+    try{
+      const [get]=await this.call(s,[["EmailSubmission/get",{accountId:s.accountId,ids:[submissionId]},'status']],true);
+      submission=get.list?.find((item:any)=>item.id===submissionId&&item.emailId===id);
+    }catch{throw uncertain();}
+    if(!submission)throw uncertain();
+    const recipients=[...new Set<string>([...p.to,...p.cc,...p.bcc].map((email:string)=>email.toLowerCase()))];
+    const outcome=submissionOutcome(submission,recipients);
+    if(!outcome)throw uncertain();
+    if(outcome.retry.length){
+      // Persist before acknowledging a retry. A DB failure retains the original
+      // duplicate guard and cannot masquerade as a safely queued operation.
+      if(!this.store.retries)throw uncertain();
+      try{await this.store.retries.schedule({accountId:s.accountId,emailId:id,sourceDraftId:p.draftId,identityId:sender.id,sender:s.email,submissionId,outcome,token:s.token});}
+      catch{throw uncertain();}
+      if(outcome.accepted)await this.moveSubmittedToSent(s,id,draftBox,sentBox);
+      return {submissionId,status:'retrying' as const,messageId:id,failedRecipients:outcome.failed};
+    }
+    if(outcome.failed===recipients.length){
+      await this.store.releaseSend(s.id,digest);
+      throw new AppError('SEND_REJECTED',422,'Message not sent: the mail server rejected delivery to all recipients. Your message remains in Drafts.',{draftId:id});
+    }
+    await this.moveSubmittedToSent(s,id,draftBox,sentBox);
+    if(outcome.failed){
+      // Some recipients may already have received it. Keep the duplicate guard,
+      // and do not expose BCC addresses or raw provider replies in the error.
+      throw new AppError('SEND_PARTIAL_FAILURE',409,'The message was not sent to all recipients. A copy is in Sent. Do not resend to everyone; some recipients may already have received it.');
+    }
+    return submissionId as string;
+  }
 }
