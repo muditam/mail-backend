@@ -118,8 +118,60 @@ export class Stalwart {
     if(p.draftId){const [removed]=await this.call(s,[["Email/set",{accountId:s.accountId,destroy:[p.draftId]},'d']]);if(removed.notDestroyed?.[p.draftId])throw unavailable();}
     return newId as string;}
   async deleteDraft(s:Session,id:string){const [existing]=await this.call(s,[['Email/get',{accountId:s.accountId,ids:[id],properties:['id','keywords']},'e']]);if(!existing.list?.[0]?.keywords?.['$draft'])throw new AppError('DRAFT_NOT_FOUND',404,'Draft not found.');const [r]=await this.call(s,[['Email/set',{accountId:s.accountId,destroy:[id]},'d']]);if(r.notDestroyed?.[id])throw unavailable();}
-  async send(s:Session,p:any){const id=await this.draft(s,p);const boxes=await this.mailboxes(s);const draftBox=boxes.find((x:any)=>x.role==='drafts')?.id;const sentBox=boxes.find((x:any)=>x.role==='sent')?.id;if(!draftBox||!sentBox)throw new AppError('SEND_REJECTED',422,'Required mailboxes are unavailable.');
-    const [identity]=await this.call(s,[["Identity/get",{accountId:s.accountId},'i']],true);const sender=(identity.list||[]).find((x:any)=>String(x.email).toLowerCase()===s.email.toLowerCase());if(!sender)throw new AppError('SEND_REJECTED',422,'No sending identity is available for this account.');
-    const digest=createHash('sha256').update(JSON.stringify(p)).digest('hex');if(!await this.store.reserveSend(s.id,digest))throw new AppError('SEND_STATUS_UNKNOWN',409,'This message was already submitted or its status is unknown. Check Sent before retrying.');
-    const [r]=await this.call(s,[["EmailSubmission/set",{accountId:s.accountId,create:{send:{emailId:id,identityId:sender.id}},onSuccessUpdateEmail:{'#send':{[`mailboxIds/${draftBox}`]:null,[`mailboxIds/${sentBox}`]:true,'keywords/$draft':null}}},'s']],true);const submissionId=r.created?.send?.id;if(!submissionId){await this.store.releaseSend(s.id,digest);throw new AppError('SEND_REJECTED',422,'Mail server rejected the message.');}await this.store.acceptSend(s.id,digest,submissionId);return submissionId as string;}
+  async send(s:Session,p:any){
+    const boxes=await this.mailboxes(s);
+    const draftBox=boxes.find((x:any)=>x.role==='drafts')?.id,sentBox=boxes.find((x:any)=>x.role==='sent')?.id;
+    if(!draftBox||!sentBox)throw new AppError('SEND_REJECTED',422,'Required mailboxes are unavailable.');
+    const [identity]=await this.call(s,[["Identity/get",{accountId:s.accountId},'i']],true);
+    const sender=(identity.list||[]).find((x:any)=>String(x.email).toLowerCase()===s.email.toLowerCase());
+    if(!sender)throw new AppError('SEND_REJECTED',422,'No sending identity is available for this account.');
+    const uncertain=()=>new AppError('SEND_STATUS_UNKNOWN',503,'Could not confirm send. Check Sent and Drafts before retrying; the message may already have been submitted.');
+    const digest=createHash('sha256').update(JSON.stringify(p)).digest('hex');
+    if(!await this.store.reserveSend(s.id,digest))throw uncertain();
+    let id:string;
+    try{id=await this.draft(s,p);}catch(error){await this.store.releaseSend(s.id,digest);throw error;}
+    // Creation of a submission does not mean its recipients were accepted.
+    // Do not let onSuccessUpdateEmail move a rejected submission into Sent.
+    let result:any;
+    try{[result]=await this.call(s,[["EmailSubmission/set",{accountId:s.accountId,create:{send:{emailId:id,identityId:sender.id}}},'s']],true);}
+    catch{throw uncertain();} // Keep the duplicate guard after ambiguous network/provider failures.
+    const submissionId=result.created?.send?.id;
+    if(typeof submissionId!=='string'||!submissionId){
+      if(result.notCreated?.send){
+        await this.store.releaseSend(s.id,digest);
+        throw new AppError('SEND_REJECTED',422,'Mail server rejected the message. Your message remains in Drafts.',{draftId:id});
+      }
+      throw uncertain();
+    }
+    await this.store.acceptSend(s.id,digest,submissionId);
+    let submission:any;
+    try{
+      const [get]=await this.call(s,[["EmailSubmission/get",{accountId:s.accountId,ids:[submissionId]},'status']],true);
+      submission=get.list?.find((item:any)=>item.id===submissionId&&item.emailId===id);
+    }catch{throw uncertain();}
+    if(!submission)throw uncertain();
+    const recipients=[...new Set<string>([...p.to,...p.cc,...p.bcc].map((email:string)=>email.toLowerCase()))];
+    const statuses=new Map<string,any>(Object.entries(submission.deliveryStatus||{}).map(([email,status])=>[email.toLowerCase(),status]));
+    const outcomes=recipients.map(email=>statuses.get(email));
+    // Missing/malformed status must never hide a failure or enable an unsafe retry.
+    if(!outcomes.length||outcomes.some(value=>!value||!['yes','no','queued','unknown'].includes(value.delivered)))throw uncertain();
+    const failed=outcomes.filter(value=>value.delivered==='no');
+    if(failed.length===outcomes.length){
+      await this.store.releaseSend(s.id,digest);
+      const rateLimited=failed.some(value=>/rate limit/i.test(value.smtpReply||''));
+      throw new AppError('SEND_REJECTED',422,rateLimited
+        ?'Message not sent: the mail server rate limit was reached. Your message remains in Drafts. Try again later.'
+        :'Message not sent: the mail server rejected delivery to all recipients. Your message remains in Drafts.',{draftId:id});
+    }
+    try{
+      const [updated]=await this.call(s,[["Email/set",{accountId:s.accountId,update:{[id]:{[`mailboxIds/${draftBox}`]:null,[`mailboxIds/${sentBox}`]:true,'keywords/$draft':null}}},'sent']]);
+      if(updated.notUpdated?.[id]||!Object.prototype.hasOwnProperty.call(updated.updated||{},id))throw uncertain();
+    }catch{throw uncertain();}
+    if(failed.length){
+      // Some recipients may already have received it. Keep the duplicate guard,
+      // and do not expose BCC addresses or raw provider replies in the error.
+      throw new AppError('SEND_PARTIAL_FAILURE',409,'The message was not sent to all recipients. A copy is in Sent. Do not resend to everyone; some recipients may already have received it.');
+    }
+    return submissionId as string;
+  }
 }

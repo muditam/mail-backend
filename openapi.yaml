@@ -22,6 +22,11 @@ components:
             code: {type: string}
             message: {type: string}
             requestId: {type: string}
+            details:
+              type: object
+              description: Recovery information for a definitively rejected send.
+              properties:
+                draftId: {type: string, description: ID of the saved draft to use when retrying.}
     Safety:
       type: object
       required: [classification, fromDomain]

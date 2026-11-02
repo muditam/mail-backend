@@ -20,9 +20,11 @@ test('draft API preserves multiple BCC recipients and attachments across reopen 
    if(method==='Email/query')return [{ids:[...messages.keys()]}];
    if(method==='Email/set'){
     if(args.create){const id=`D${++sequence}`;messages.set(id,{id,...structuredClone(args.create.draft)});return [{created:{draft:{id}}}];}
+    if(args.update){for(const [id,patch] of Object.entries(args.update))Object.assign(messages.get(id),patch);return [{updated:Object.fromEntries(Object.keys(args.update).map(id=>[id,null]))}];}
     for(const id of args.destroy)messages.delete(id);return [{destroyed:args.destroy}];
    }
    if(method==='Identity/get')return [{list:[{id:'identity',email:session.email}]}];
+   if(method==='EmailSubmission/get')return [{list:[{id:'submission',emailId:submitted.id,deliveryStatus:Object.fromEntries([...submitted.to,...submitted.cc,...submitted.bcc].map(a=>[a.email,{delivered:'queued'}]))}]}];
    if(method==='EmailSubmission/set'){
     // Submission references the stored email, which contains distinct To/CC/BCC fields.
     submitted=messages.get(args.create.send.emailId);
