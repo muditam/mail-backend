@@ -1,3 +1,4 @@
+import {RetryQueue} from './retries.js';
 import { createCipheriv, createDecipheriv, randomBytes, createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import { MongoClient, MongoServerError, type Collection, type Db } from 'mongodb';
 import type { Config } from './config.js';
@@ -11,12 +12,14 @@ type SendRow = { _id: string; sessionHash: string; payloadHash: string; createdA
 const hash = (s: string) => createHash('sha256').update(s).digest('hex');
 
 export class Store {
+  readonly retries: RetryQueue;
   private key: Buffer;
   private sessions: Collection<SessionRow>;
   private uploads: Collection<UploadRow>;
   private sends: Collection<SendRow>;
 
   private constructor(private config: Config, private client: MongoClient, db: Db) {
+    this.retries = new RetryQueue(db, config);
     this.key = Buffer.from(config.SESSION_ENCRYPTION_KEY, 'base64');
     this.sessions = db.collection<SessionRow>('sessions');
     this.uploads = db.collection<UploadRow>('uploads');
@@ -29,6 +32,7 @@ export class Store {
       await client.connect();
       const store = new Store(config, client, client.db(config.MONGODB_DB_NAME));
       await Promise.all([
+        store.retries.init(),
         store.sessions.createIndex({ expireAt: 1 }, { expireAfterSeconds: 0 }),
         store.uploads.createIndex({ expireAt: 1 }, { expireAfterSeconds: 0 }),
         store.uploads.createIndex({ sessionHash: 1 }),

@@ -33,10 +33,20 @@ components:
       properties:
         classification: {type: string, enum: [internal, external, suspicious]}
         fromDomain: {type: string, nullable: true}
+    DeliveryRetry:
+      type: object
+      properties:
+        state: {type: string, enum: [waiting, working, dispatching, completed, failed, attention]}
+        attempts: {type: integer}
+        nextAttemptAt: {type: string, format: date-time}
+        pending: {type: integer}
+        failed: {type: integer}
+        accepted: {type: integer}
     MessageSummary:
       type: object
       required: [id, safety]
       properties:
+        deliveryRetry: {$ref: '#/components/schemas/DeliveryRetry'}
         id: {type: string}
         safety: {$ref: '#/components/schemas/Safety'}
     DraftPayload:
@@ -140,7 +150,7 @@ paths:
           application/json:
             schema: {$ref: '#/components/schemas/DraftPayload'}
       responses:
-        '202': {description: 'submissionId and queued status'}
+        '202': {description: 'submissionId and status: queued, or retrying with messageId and failedRecipients. Retrying is not a delivery confirmation.'}
   /attachments:
     post:
       summary: Upload an attachment
@@ -197,7 +207,7 @@ paths:
                 type: object
                 required: [status, submissionId]
                 properties:
-                  status: {type: string, enum: [queued]}
+                  status: {type: string, enum: [queued, retrying]}
                   submissionId: {type: string}
         '400': {description: Invalid payload}
         '401': {description: Session expired}
