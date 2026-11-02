@@ -1,3 +1,4 @@
+import {companyFooterText} from '../src/companyFooter.js';
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {Stalwart} from '../src/stalwart.js';
@@ -40,6 +41,8 @@ test('draft API preserves multiple BCC recipients and attachments across reopen 
   const save=await app.inject({method:'POST',url:'/api/app/v1/drafts',headers,payload:original});assert.equal(save.statusCode,200);
   const draftId=save.json().draftId;
   assert.deepEqual(messages.get(draftId).bcc,original.bcc.map(email=>({email})));
+  assert.equal(messages.get(draftId).bodyValues.body.value,original.bodyText);
+  assert.equal(messages.get(draftId).htmlBody,undefined);
   // Recreate the app/adapter: reopening must use server data, not composer memory.
   await app.close();app=buildApp(config,store,adapter());
   const detail=await app.inject({method:'GET',url:`/api/app/v1/messages/${draftId}`,headers});assert.equal(detail.statusCode,200);
@@ -52,7 +55,9 @@ test('draft API preserves multiple BCC recipients and attachments across reopen 
   const send=await app.inject({method:'POST',url:'/api/app/v1/messages/send',headers,payload:{draftId,to:message.to.map((a:any)=>a.email),cc:message.cc.map((a:any)=>a.email),bcc:message.bcc.map((a:any)=>a.email),subject:message.subject,bodyText:message.bodyText,attachmentIds:message.attachments.map((a:any)=>a.id)}});
   assert.equal(send.statusCode,202);
   for(const field of ['to','cc','bcc'] as const)assert.deepEqual(submitted[field].map((a:any)=>a.email),original[field]);
-  assert.equal(submitted.attachments[0].blobId,'blob');assert.equal(submitted.bodyValues.body.value,original.bodyText);
+  assert.equal(submitted.attachments[0].blobId,'blob');assert.equal(submitted.bodyValues.body.value,original.bodyText+'\n\n-- \n'+companyFooterText);
+  assert.equal(submitted.htmlBody[0].type,'text/html');
+  assert.equal(submitted.bodyValues.html.value.split('<!-- muditam-company-footer-v1 -->').length-1,1);
   assert.equal(JSON.stringify(send.json()).includes('hidden1@example.test'),false);
  }finally{await app.close();}
 });
