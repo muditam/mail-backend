@@ -1,18 +1,20 @@
+import {Onboarding} from './onboarding.js';
 import {RetryQueue} from './retries.js';
 import { createCipheriv, createDecipheriv, randomBytes, createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import { MongoClient, MongoServerError, type Collection, type Db } from 'mongodb';
 import type { Config } from './config.js';
 
 export type Token = { access_token: string; refresh_token?: string; expires_at: number };
-export type Session = { id: string; email: string; accountId: string; csrf: string; token: Token; createdAt: number; touchedAt: number; absoluteExpiresAt: number };
+export type Session = { id: string; email: string; accountId: string; csrf: string; token: Token; createdAt: number; touchedAt: number; absoluteExpiresAt: number; passwordChangeRequired?:boolean; authVersion?:string };
 export type Upload = { id: string; sessionHash: string; blobId: string; name: string; type: string; size: number; expiresAt: number };
-type SessionRow = { _id: string; email: string; accountId: string; csrfHash: string; tokenCipher: string; createdAt: number; touchedAt: number; absoluteExpiresAt: number; expireAt: Date };
+type SessionRow = { authVersion?:string; _id: string; email: string; accountId: string; csrfHash: string; tokenCipher: string; createdAt: number; touchedAt: number; absoluteExpiresAt: number; expireAt: Date };
 type UploadRow = { _id: string; sessionHash: string; blobId: string; name: string; type: string; size: number; expiresAt: number; expireAt: Date };
 type SendRow = { _id: string; sessionHash: string; payloadHash: string; createdAt: number; submissionId?: string; expireAt: Date };
 const hash = (s: string) => createHash('sha256').update(s).digest('hex');
 
 export class Store {
   readonly retries: RetryQueue;
+  readonly onboarding: Onboarding;
   private key: Buffer;
   private sessions: Collection<SessionRow>;
   private uploads: Collection<UploadRow>;
@@ -20,6 +22,7 @@ export class Store {
 
   private constructor(private config: Config, private client: MongoClient, db: Db) {
     this.retries = new RetryQueue(db, config);
+    this.onboarding = new Onboarding(db);
     this.key = Buffer.from(config.SESSION_ENCRYPTION_KEY, 'base64');
     this.sessions = db.collection<SessionRow>('sessions');
     this.uploads = db.collection<UploadRow>('uploads');
@@ -62,9 +65,10 @@ export class Store {
 
   async create(email: string, accountId: string, token: Token): Promise<Session> {
     const now = Date.now(), id = randomBytes(32).toString('base64url'), csrf = this.csrfToken(id);
+    const policy=await this.onboarding.get(accountId);
     const end = now + this.config.SESSION_ABSOLUTE_HOURS * 3600000;
-    await this.sessions.insertOne({ _id: hash(id), email, accountId, csrfHash: hash(csrf), tokenCipher: this.seal(token), createdAt: now, touchedAt: now, absoluteExpiresAt: end, expireAt: new Date(end) });
-    return { id, email, accountId, csrf, token, createdAt: now, touchedAt: now, absoluteExpiresAt: end };
+    await this.sessions.insertOne({ _id: hash(id), email, accountId, authVersion:policy?.version, csrfHash: hash(csrf), tokenCipher: this.seal(token), createdAt: now, touchedAt: now, absoluteExpiresAt: end, expireAt: new Date(end) });
+    return { id, email, accountId, csrf, token, createdAt: now, touchedAt: now, absoluteExpiresAt: end, authVersion:policy?.version, passwordChangeRequired:!!policy&&policy.state!=='complete' };
   }
   async get(id: string): Promise<Session | undefined> {
     const now = Date.now();
@@ -73,7 +77,9 @@ export class Store {
       { $set: { touchedAt: now } }, { returnDocument: 'after' },
     );
     if (!row) return undefined;
-    return { id, email: row.email, accountId: row.accountId, csrf: '', token: this.open(row.tokenCipher), createdAt: row.createdAt, touchedAt: row.touchedAt, absoluteExpiresAt: row.absoluteExpiresAt };
+    const policy=await this.onboarding.get(row.accountId);
+    if(policy&&policy.version!==row.authVersion)return undefined;
+    return { authVersion:row.authVersion,passwordChangeRequired:!!policy&&policy.state!=='complete', id, email: row.email, accountId: row.accountId, csrf: '', token: this.open(row.tokenCipher), createdAt: row.createdAt, touchedAt: row.touchedAt, absoluteExpiresAt: row.absoluteExpiresAt };
   }
   csrfToken(id: string): string {
     // Session-bound and stable across tabs, restores and backend instances.
@@ -98,6 +104,7 @@ export class Store {
     await this.sessions.deleteOne({ _id: sessionHash });
     await Promise.all([this.uploads.deleteMany({ sessionHash }), this.sends.deleteMany({ sessionHash })]);
   }
+  async revokeAccount(accountId:string){await this.sessions.deleteMany({accountId});}
   async addUpload(sessionId: string, blobId: string, name: string, type: string, size: number): Promise<Upload> {
     const upload = { id: randomBytes(24).toString('base64url'), sessionHash: hash(sessionId), blobId, name, type, size, expiresAt: Date.now() + 3600000 };
     await this.uploads.insertOne({ _id: upload.id, sessionHash: upload.sessionHash, blobId, name, type, size, expiresAt: upload.expiresAt, expireAt: new Date(upload.expiresAt) });

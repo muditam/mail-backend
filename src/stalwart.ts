@@ -36,6 +36,23 @@ export class Stalwart {
     const token:Token={access_token:exchange.body.access_token,refresh_token:exchange.body.refresh_token,expires_at:Date.now()+Math.max(1,Number(exchange.body.expires_in)||3600)*1000};
     const discovery=await this.discover(token.access_token);return {token,accountId:this.account(discovery)};
   }
+  async setupPassword(s:Session,currentPassword:string,newPassword:string){
+    const {access,session}=await this.context(s);
+    if(!session.capabilities?.['urn:stalwart:jmap']&&!session.accounts?.[s.accountId]?.accountCapabilities?.['urn:stalwart:jmap'])throw new AppError('PASSWORD_SETUP_UNAVAILABLE',503,'Password setup is unavailable. Ask IT to check account permissions and server support.');
+    let response:Response;
+    try{response=await this.fetcher(this.safeUrl(session.apiUrl),{method:'POST',redirect:'error',signal:timeout(20000),headers:{authorization:`Bearer ${access}`,'content-type':'application/json'},body:JSON.stringify({using:[CORE,'urn:stalwart:jmap'],methodCalls:[['x:AccountPassword/set',{update:{singleton:{currentSecret:currentPassword,secret:newPassword}}},'password']]})});}
+    catch{throw new AppError('PASSWORD_CHANGE_UNKNOWN',503,'Could not confirm the change. Do not keep submitting. Wait two minutes, then sign in using the password that works and complete setup.');}
+    let body:any;try{body=await response.json();}catch{throw new AppError('PASSWORD_CHANGE_UNKNOWN',503,'Could not confirm the change. Sign in again with the password that works before retrying.');}
+    const result=body?.methodResponses?.find((r:any)=>r?.[2]==='password');
+    const error=result?.[0]==='error'?result[1]:result?.[1]?.notUpdated?.singleton;
+    if(error){
+      if(result?.[0]==='error'&&!['forbidden','unknownMethod','invalidArguments','accountNotFound'].includes(error.type))throw new AppError('PASSWORD_CHANGE_UNKNOWN',503,'Could not confirm the password change. Sign in with the password that works before retrying.');
+      if(error.type==='invalidProperties')throw new AppError('PASSWORD_POLICY',400,'The mail server rejected this password. Choose a stronger password with 12–128 characters.');
+      if(error.type==='forbidden'&&/Current secret is incorrect/.test(error.description||''))throw new AppError('PASSWORD_CURRENT_INVALID',400,'Your current password is incorrect.');
+      throw new AppError('PASSWORD_CHANGE_REJECTED',403,'The mail server rejected password setup. Verify your current password or contact IT to check permissions.');
+    }
+    if(!response.ok||result?.[0]!=='x:AccountPassword/set'||!Object.prototype.hasOwnProperty.call(result?.[1]?.updated||{},'singleton'))throw new AppError('PASSWORD_CHANGE_UNKNOWN',503,'Could not confirm the password change. Sign in with the password that works before retrying.');
+  }
   private account(s:JSession){const id=s.primaryAccounts?.[MAIL];if(!id||!s.accounts?.[id]?.accountCapabilities?.[MAIL]||!s.capabilities?.[CORE]||!s.capabilities?.[MAIL])throw unavailable();return id;}
   async discover(accessToken:string):Promise<JSession>{const r=await this.json(this.config.STALWART_JMAP_SESSION_URL,{headers:{authorization:`Bearer ${accessToken}`}});if(r.status!==200||!r.body?.apiUrl||!r.body?.uploadUrl||!r.body?.downloadUrl)throw unavailable();this.safeUrl(r.body.apiUrl);this.safeUrl(r.body.uploadUrl);this.safeUrl(r.body.downloadUrl);return r.body;}
   private async token(s:Session):Promise<string>{if(s.token.expires_at>Date.now()+30000)return s.token.access_token;if(!s.token.refresh_token){await this.store.delete(s.id);throw new AppError('SESSION_EXPIRED',401,'Please sign in again.');}

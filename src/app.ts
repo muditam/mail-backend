@@ -34,13 +34,30 @@ export function buildApp(config:Config,store:Store,stalwart:Stalwart):FastifyIns
   if(s&&reply.statusCode>=200&&reply.statusCode<300&&!reply.hasHeader('Set-Cookie'))reply.header('Set-Cookie',sessionCookie(s));
   return payload;
  });
- const session=async(request:FastifyRequest)=>{const sid=cookie(request);const s=sid&&await store.get(sid);if(!s)throw new AppError('SESSION_EXPIRED',401,'Please sign in again.');authenticated.set(request,s);return s;};
+ const session=async(request:FastifyRequest)=>{const sid=cookie(request);const s=sid&&await store.get(sid);if(!s)throw new AppError('SESSION_EXPIRED',401,'Please sign in again.');authenticated.set(request,s);if(s.passwordChangeRequired&&!['/api/app/v1/auth/session','/api/app/v1/auth/logout','/api/app/v1/auth/password-setup'].includes(request.routeOptions.url||''))throw new AppError('PASSWORD_CHANGE_REQUIRED',403,'Set your new password before opening mail.');return s;};
  const state=async(request:FastifyRequest)=>{origin(request,config);const s=await session(request);const csrf=request.headers['x-csrf-token'];if(typeof csrf!=='string'||!await store.checkCsrf(s.id,csrf))throw new AppError('CSRF_FAILED',403,'Invalid CSRF token.');return s;};
  app.get('/health',async()=>({status:'ok'}));
  app.get('/ready',async()=>{await store.ready();return {status:'ok'};});
- app.post('/api/app/v1/auth/login',async(request,reply)=>{origin(request,config);const body=parse(login,request.body);const ip=request.ip;throttle(`ip:${ip}`,20,15*60000);throttle(`account:${body.email.toLowerCase()}`,10,15*60000);const {token,accountId}=await stalwart.login(body.email,body.password);const old=cookie(request);if(old)await store.delete(old);const s=await store.create(body.email.toLowerCase(),accountId,token);reply.header('Set-Cookie',sessionCookie(s));return {user:{email:s.email},csrfToken:s.csrf};});
- app.get('/api/app/v1/auth/session',async(request)=>{const s=await session(request);return {user:{email:s.email},csrfToken:store.csrfToken(s.id)};});
+ app.post('/api/app/v1/auth/login',async(request,reply)=>{origin(request,config);const body=parse(login,request.body);const ip=request.ip;throttle(`ip:${ip}`,20,15*60000);throttle(`account:${body.email.toLowerCase()}`,10,15*60000);const {token,accountId}=await stalwart.login(body.email,body.password);await store.onboarding.enrollIfNew(accountId,body.email);const old=cookie(request);if(old)await store.delete(old);const s=await store.create(body.email.toLowerCase(),accountId,token);reply.header('Set-Cookie',sessionCookie(s));return {user:{email:s.email},passwordChangeRequired:!!s.passwordChangeRequired,csrfToken:s.csrf};});
+ app.get('/api/app/v1/auth/session',async(request)=>{const s=await session(request);return {user:{email:s.email},passwordChangeRequired:!!s.passwordChangeRequired,csrfToken:store.csrfToken(s.id)};});
  app.post('/api/app/v1/auth/logout',async(request,reply)=>{const s=await state(request);await store.delete(s.id);reply.header('Set-Cookie',secureCookie(config,'',0)).code(204).send();});
+ app.post('/api/app/v1/auth/password-setup',async(request,reply)=>{
+  const s=await state(request);if(!s.passwordChangeRequired||!s.authVersion)throw new AppError('PASSWORD_SETUP_NOT_REQUIRED',409,'Password setup is not required for this account.');
+  throttle(`password-setup:${s.accountId}`,5,15*60000);
+  const b=parse(z.object({currentPassword:z.string().min(1).max(1024),newPassword:z.string().min(12).max(128)}).strict(),request.body);
+  if(b.currentPassword===b.newPassword||!b.newPassword.trim())throw new AppError('PASSWORD_POLICY',400,'Choose a different password with 12–128 characters.');
+  const operation=await store.onboarding.begin(s.accountId,s.authVersion);
+  try{await stalwart.setupPassword(s,b.currentPassword,b.newPassword);}catch(error){
+   // Only explicit provider rejections unlock the operation. A timeout may have
+   // committed the change; keep the restriction and short lock for recovery.
+   if(error instanceof AppError&&['PASSWORD_CHANGE_REJECTED','PASSWORD_POLICY','PASSWORD_CURRENT_INVALID','PASSWORD_SETUP_UNAVAILABLE'].includes(error.code))await store.onboarding.rejected(s.accountId,operation);
+   throw error;
+  }
+  await store.onboarding.complete(s.accountId,operation);
+  await store.revokeAccount(s.accountId);
+  request.log.info({accountId:s.accountId,event:'password_setup_completed'},'Password setup completed; webmail sessions revoked');
+  reply.header('Set-Cookie',secureCookie(config,'',0));return {status:'password_changed',signInRequired:true};
+ });
  app.get('/api/app/v1/mailboxes',async(request)=>{const s=await session(request);throttle(`mailboxes:${s.id}`,30,60000);return {mailboxes:await stalwart.mailboxes(s)};});
  app.get('/api/app/v1/messages',async(request)=>{const q=parse(z.object({mailboxId:id.optional(),starred:z.enum(['true']).optional(),q:z.string().trim().min(1).max(256).optional(),cursor:z.string().regex(/^\d{1,8}$/).optional(),limit:z.coerce.number().int().min(1).max(100).default(30)}).strict().refine(q=>!!q.mailboxId||!!q.q||q.starred==='true'),request.query),s=await session(request);throttle(`messages:${s.id}`,60,60000);if(q.q)throttle(`search:${s.id}`,20,60000);return stalwart.messages(s,q.mailboxId,Number(q.cursor||0),q.limit,q.q,q.starred==='true'?true:undefined);});
  app.get('/api/app/v1/messages/:id',async(request)=>{const p=parse(z.object({id}),request.params);return {message:await stalwart.message(await session(request),p.id)};});
