@@ -44,8 +44,8 @@ export function buildApp(config:Config,store:Store,stalwart:Stalwart):FastifyIns
  app.post('/api/app/v1/auth/password-setup',async(request,reply)=>{
   const s=await state(request);if(!s.passwordChangeRequired||!s.authVersion)throw new AppError('PASSWORD_SETUP_NOT_REQUIRED',409,'Password setup is not required for this account.');
   throttle(`password-setup:${s.accountId}`,5,15*60000);
-  const b=parse(z.object({currentPassword:z.string().min(1).max(1024),newPassword:z.string().min(12).max(128)}).strict(),request.body);
-  if(b.currentPassword===b.newPassword||!b.newPassword.trim())throw new AppError('PASSWORD_POLICY',400,'Choose a different password with 12–128 characters.');
+  const b=parse(z.object({currentPassword:z.string().min(1).max(1024),newPassword:z.string().min(8).max(128)}).strict(),request.body);
+  if(b.currentPassword===b.newPassword||!b.newPassword.trim())throw new AppError('PASSWORD_POLICY',400,'Choose a different password with 8–128 characters.');
   const operation=await store.onboarding.begin(s.accountId,s.authVersion);
   try{await stalwart.setupPassword(s,b.currentPassword,b.newPassword);}catch(error){
    // Only explicit provider rejections unlock the operation. A timeout may have
