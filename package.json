@@ -11,7 +11,8 @@
     "build": "tsc",
     "start": "node dist/server.js",
     "test": "node --import tsx --test test/*.test.ts",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "onboard": "tsx scripts/require-password-setup.ts"
   },
   "dependencies": {
     "@fastify/multipart": "^9.3.0",
