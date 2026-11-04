@@ -45,3 +45,7 @@ Automated tests use isolated MongoDB plus mocked provider replies for restricted
 Source references:
 - https://github.com/stalwartlabs/stalwart/blob/v0.16.26/crates/jmap/src/registry/mapping/account.rs
 - https://stalw.art/docs/ref/object/account-password/
+
+## Authentication diagnostics
+
+Structured backend events record login, password setup stages, logout and session rejection reasons. `sessionRef` is a domain-separated HMAC of the session hash; it cannot be used as a cookie or CSRF token. Logs include the authenticated email/account and request ID, never password fields or OAuth credentials. `session_revocations` retains account/email, hashed session identifier and reason for seven days with a MongoDB TTL index. Revocation records are written before deletion; existing policy version checks continue to deny sessions after a password change. Expired rows can explain idle/absolute timeouts while present; after TTL removal or for pre-deployment deletions the honest result is `unknown_session`. Missing cookies cannot be assigned to an employee. No additional environment variables are needed.

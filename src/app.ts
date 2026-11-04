@@ -20,7 +20,7 @@ function secureCookie(config:Config,id:string,maxAge:number){return `${cookieNam
 export function buildApp(config:Config,store:Store,stalwart:Stalwart):FastifyInstance{
  const app=Fastify({logger:{level:'info',redact:{paths:['req.headers.authorization','req.headers.cookie','res.headers.set-cookie'],censor:'[redacted]'}},bodyLimit:1200000,trustProxy:false});
  app.register(multipart,{limits:{files:1,fileSize:20*1024*1024,fields:0,parts:1}});
- app.setErrorHandler((error,request,reply)=>{let e=error instanceof AppError?error:unavailable();if((error as any).code==='FST_REQ_FILE_TOO_LARGE')e=new AppError('ATTACHMENT_TOO_LARGE',413,'Attachment exceeds 20 MB.');else if((error as any).code==='FST_ERR_CTP_BODY_TOO_LARGE')e=new AppError('INVALID_REQUEST',413,'Request is too large.');request.log.warn({requestId:request.id,route:request.routeOptions.url,code:e.code,status:e.status},'request failed');reply.code(e.status).send({error:{code:e.code,message:e.message,requestId:request.id,...(e.details?{details:e.details}:{})}});});
+ app.setErrorHandler((error,request,reply)=>{let e=error instanceof AppError?error:unavailable();if((error as any).code==='FST_REQ_FILE_TOO_LARGE')e=new AppError('ATTACHMENT_TOO_LARGE',413,'Attachment exceeds 20 MB.');else if((error as any).code==='FST_ERR_CTP_BODY_TOO_LARGE')e=new AppError('INVALID_REQUEST',413,'Request is too large.');const active=authenticated.get(request);if(request.routeOptions.url==='/api/app/v1/auth/login')request.log.info({event:'auth_login_failed',code:e.code,status:e.status},'Login failed');if(active&&(request.routeOptions.url?.startsWith('/api/app/v1/auth/')||['SESSION_EXPIRED','CSRF_FAILED'].includes(e.code)))request.log.warn({event:'auth_request_failed',accountId:active.accountId,email:active.email,sessionRef:store.sessionRef?.(active.id),reason:e.authReason,code:e.code,status:e.status},'Authentication action failed');request.log.warn({requestId:request.id,route:request.routeOptions.url,code:e.code,status:e.status},'request failed');reply.code(e.status).send({error:{code:e.code,message:e.message,requestId:request.id,...(e.details?{details:e.details}:{})}});});
  app.addHook('onRequest',async(request,reply)=>{reply.header('Cache-Control','no-store');reply.header('X-Content-Type-Options','nosniff');});
  const authenticated=new WeakMap<FastifyRequest,Session>();
  const sessionCookie=(s:Session)=>{
@@ -34,28 +34,32 @@ export function buildApp(config:Config,store:Store,stalwart:Stalwart):FastifyIns
   if(s&&reply.statusCode>=200&&reply.statusCode<300&&!reply.hasHeader('Set-Cookie'))reply.header('Set-Cookie',sessionCookie(s));
   return payload;
  });
- const session=async(request:FastifyRequest)=>{const sid=cookie(request);const s=sid&&await store.get(sid);if(!s)throw new AppError('SESSION_EXPIRED',401,'Please sign in again.');authenticated.set(request,s);if(s.passwordChangeRequired&&!['/api/app/v1/auth/session','/api/app/v1/auth/logout','/api/app/v1/auth/password-setup'].includes(request.routeOptions.url||''))throw new AppError('PASSWORD_CHANGE_REQUIRED',403,'Set your new password before opening mail.');return s;};
+ const session=async(request:FastifyRequest)=>{const sid=cookie(request);const s=sid&&await store.get(sid,detail=>request.log.info({event:'auth_session_rejected',...detail},'Session rejected'));if(!sid)request.log.info({event:'auth_session_rejected',reason:'missing_cookie'},'Session cookie missing');if(!s)throw new AppError('SESSION_EXPIRED',401,'Please sign in again.');authenticated.set(request,s);if(s.passwordChangeRequired&&!['/api/app/v1/auth/session','/api/app/v1/auth/logout','/api/app/v1/auth/password-setup'].includes(request.routeOptions.url||''))throw new AppError('PASSWORD_CHANGE_REQUIRED',403,'Set your new password before opening mail.');return s;};
  const state=async(request:FastifyRequest)=>{origin(request,config);const s=await session(request);const csrf=request.headers['x-csrf-token'];if(typeof csrf!=='string'||!await store.checkCsrf(s.id,csrf))throw new AppError('CSRF_FAILED',403,'Invalid CSRF token.');return s;};
  app.get('/health',async()=>({status:'ok'}));
  app.get('/ready',async()=>{await store.ready();return {status:'ok'};});
- app.post('/api/app/v1/auth/login',async(request,reply)=>{origin(request,config);const body=parse(login,request.body);const ip=request.ip;throttle(`ip:${ip}`,20,15*60000);throttle(`account:${body.email.toLowerCase()}`,10,15*60000);const {token,accountId}=await stalwart.login(body.email,body.password);await store.onboarding.enrollIfNew(accountId,body.email);const old=cookie(request);if(old)await store.delete(old);const s=await store.create(body.email.toLowerCase(),accountId,token);reply.header('Set-Cookie',sessionCookie(s));return {user:{email:s.email},passwordChangeRequired:!!s.passwordChangeRequired,csrfToken:s.csrf};});
+ app.post('/api/app/v1/auth/login',async(request,reply)=>{origin(request,config);const body=parse(login,request.body);const ip=request.ip;throttle(`ip:${ip}`,20,15*60000);throttle(`account:${body.email.toLowerCase()}`,10,15*60000);const {token,accountId}=await stalwart.login(body.email,body.password);await store.onboarding.enrollIfNew(accountId,body.email);const old=cookie(request);if(old)await store.delete(old,'replaced_by_login');const s=await store.create(body.email.toLowerCase(),accountId,token);request.log.info({event:'auth_login_succeeded',accountId:s.accountId,email:s.email,sessionRef:store.sessionRef?.(s.id)},'Login succeeded');reply.header('Set-Cookie',sessionCookie(s));return {user:{email:s.email},passwordChangeRequired:!!s.passwordChangeRequired,csrfToken:s.csrf};});
  app.get('/api/app/v1/auth/session',async(request)=>{const s=await session(request);return {user:{email:s.email},passwordChangeRequired:!!s.passwordChangeRequired,csrfToken:store.csrfToken(s.id)};});
- app.post('/api/app/v1/auth/logout',async(request,reply)=>{const s=await state(request);await store.delete(s.id);reply.header('Set-Cookie',secureCookie(config,'',0)).code(204).send();});
+ app.post('/api/app/v1/auth/logout',async(request,reply)=>{const s=await state(request);await store.delete(s.id);request.log.info({event:'auth_logout_completed',accountId:s.accountId,email:s.email,sessionRef:store.sessionRef?.(s.id),reason:'logout'},'Logout completed');reply.header('Set-Cookie',secureCookie(config,'',0)).code(204).send();});
  app.post('/api/app/v1/auth/password-setup',async(request,reply)=>{
   const s=await state(request);if(!s.passwordChangeRequired||!s.authVersion)throw new AppError('PASSWORD_SETUP_NOT_REQUIRED',409,'Password setup is not required for this account.');
   throttle(`password-setup:${s.accountId}`,5,15*60000);
   const b=parse(z.object({currentPassword:z.string().min(1).max(1024),newPassword:z.string().min(8).max(128)}).strict(),request.body);
   if(b.currentPassword===b.newPassword||!b.newPassword.trim())throw new AppError('PASSWORD_POLICY',400,'Choose a different password with 8–128 characters.');
+  const audit=(event:string)=>request.log.info({event,accountId:s.accountId,email:s.email,sessionRef:store.sessionRef?.(s.id)},event);
+  audit('auth_password_setup_started');
   const operation=await store.onboarding.begin(s.accountId,s.authVersion);
-  try{await stalwart.setupPassword(s,b.currentPassword,b.newPassword);}catch(error){
+  try{await stalwart.setupPassword(s,b.currentPassword,b.newPassword);audit('auth_password_provider_confirmed');}catch(error){
    // Only explicit provider rejections unlock the operation. A timeout may have
    // committed the change; keep the restriction and short lock for recovery.
    if(error instanceof AppError&&['PASSWORD_CHANGE_REJECTED','PASSWORD_POLICY','PASSWORD_CURRENT_INVALID','PASSWORD_SETUP_UNAVAILABLE'].includes(error.code))await store.onboarding.rejected(s.accountId,operation);
    throw error;
   }
   await store.onboarding.complete(s.accountId,operation);
+  audit('auth_password_onboarding_completed');
   await store.revokeAccount(s.accountId);
-  request.log.info({accountId:s.accountId,event:'password_setup_completed'},'Password setup completed; webmail sessions revoked');
+  audit('auth_sessions_revoked');
+  request.log.info({accountId:s.accountId,email:s.email,sessionRef:store.sessionRef?.(s.id),event:'password_setup_completed'},'Password setup completed; webmail sessions revoked');
   reply.header('Set-Cookie',secureCookie(config,'',0));return {status:'password_changed',signInRequired:true};
  });
  app.get('/api/app/v1/mailboxes',async(request)=>{const s=await session(request);throttle(`mailboxes:${s.id}`,30,60000);return {mailboxes:await stalwart.mailboxes(s)};});

@@ -6,6 +6,7 @@ import type { Config } from './config.js';
 
 export type Token = { access_token: string; refresh_token?: string; expires_at: number };
 export type Session = { id: string; email: string; accountId: string; csrf: string; token: Token; createdAt: number; touchedAt: number; absoluteExpiresAt: number; passwordChangeRequired?:boolean; authVersion?:string };
+export type SessionDiagnostic = {reason:string;sessionRef?:string;accountId?:string;email?:string};
 export type Upload = { id: string; sessionHash: string; blobId: string; name: string; type: string; size: number; expiresAt: number };
 type SessionRow = { authVersion?:string; _id: string; email: string; accountId: string; csrfHash: string; tokenCipher: string; createdAt: number; touchedAt: number; absoluteExpiresAt: number; expireAt: Date };
 type UploadRow = { _id: string; sessionHash: string; blobId: string; name: string; type: string; size: number; expiresAt: number; expireAt: Date };
@@ -19,6 +20,7 @@ export class Store {
   private sessions: Collection<SessionRow>;
   private uploads: Collection<UploadRow>;
   private sends: Collection<SendRow>;
+  private revocations: Collection<any>;
 
   private constructor(private config: Config, private client: MongoClient, db: Db) {
     this.retries = new RetryQueue(db, config);
@@ -27,6 +29,7 @@ export class Store {
     this.sessions = db.collection<SessionRow>('sessions');
     this.uploads = db.collection<UploadRow>('uploads');
     this.sends = db.collection<SendRow>('send_attempts');
+    this.revocations = db.collection('session_revocations');
   }
 
   static async connect(config: Config): Promise<Store> {
@@ -36,6 +39,7 @@ export class Store {
       const store = new Store(config, client, client.db(config.MONGODB_DB_NAME));
       await Promise.all([
         store.retries.init(),
+        store.revocations.createIndex({expireAt:1},{expireAfterSeconds:0}),
         store.sessions.createIndex({ expireAt: 1 }, { expireAfterSeconds: 0 }),
         store.uploads.createIndex({ expireAt: 1 }, { expireAfterSeconds: 0 }),
         store.uploads.createIndex({ sessionHash: 1 }),
@@ -70,15 +74,21 @@ export class Store {
     await this.sessions.insertOne({ _id: hash(id), email, accountId, authVersion:policy?.version, csrfHash: hash(csrf), tokenCipher: this.seal(token), createdAt: now, touchedAt: now, absoluteExpiresAt: end, expireAt: new Date(end) });
     return { id, email, accountId, csrf, token, createdAt: now, touchedAt: now, absoluteExpiresAt: end, authVersion:policy?.version, passwordChangeRequired:!!policy&&policy.state!=='complete' };
   }
-  async get(id: string): Promise<Session | undefined> {
+  sessionRef(id:string){return createHmac('sha256',this.key).update('webmail:audit:v1\0').update(hash(id)).digest('hex').slice(0,32);}
+  async get(id: string, rejected?:(detail:SessionDiagnostic)=>void): Promise<Session | undefined> {
     const now = Date.now();
     const row = await this.sessions.findOneAndUpdate(
       { _id: hash(id), absoluteExpiresAt: { $gt: now }, touchedAt: { $gt: now - this.config.SESSION_IDLE_MINUTES * 60000 } },
       { $set: { touchedAt: now } }, { returnDocument: 'after' },
     );
-    if (!row) return undefined;
+    if (!row) {
+      const previous=await this.sessions.findOne({_id:hash(id)});
+      const revoked=await this.revocations.findOne({_id:hash(id),expireAt:{$gt:new Date(now)}});
+      rejected?.({sessionRef:this.sessionRef(id),reason:revoked?.reason||(previous?(previous.absoluteExpiresAt<=now?'absolute_timeout':'idle_timeout'):'unknown_session'),accountId:revoked?.accountId||previous?.accountId,email:revoked?.email||previous?.email});
+      return undefined;
+    }
     const policy=await this.onboarding.get(row.accountId);
-    if(policy&&policy.version!==row.authVersion)return undefined;
+    if(policy&&policy.version!==row.authVersion){rejected?.({reason:policy.state==='complete'?'password_changed':'auth_policy_changed',sessionRef:this.sessionRef(id),accountId:row.accountId,email:row.email});return undefined;}
     return { authVersion:row.authVersion,passwordChangeRequired:!!policy&&policy.state!=='complete', id, email: row.email, accountId: row.accountId, csrf: '', token: this.open(row.tokenCipher), createdAt: row.createdAt, touchedAt: row.touchedAt, absoluteExpiresAt: row.absoluteExpiresAt };
   }
   csrfToken(id: string): string {
@@ -99,12 +109,18 @@ export class Store {
   async updateToken(id: string, token: Token) {
     await this.sessions.updateOne({ _id: hash(id) }, { $set: { tokenCipher: this.seal(token) } });
   }
-  async delete(id: string) {
+  async delete(id: string, reason="logout") {
     const sessionHash = hash(id);
+    const row=await this.sessions.findOne({_id:sessionHash});
+    if(row)await this.revocations.replaceOne({_id:sessionHash},{_id:sessionHash,accountId:row.accountId,email:row.email,reason,expireAt:new Date(Date.now()+7*86400000)},{upsert:true});
     await this.sessions.deleteOne({ _id: sessionHash });
     await Promise.all([this.uploads.deleteMany({ sessionHash }), this.sends.deleteMany({ sessionHash })]);
   }
-  async revokeAccount(accountId:string){await this.sessions.deleteMany({accountId});}
+  async revokeAccount(accountId:string,reason='password_changed'){
+    const rows=await this.sessions.find({accountId},{projection:{_id:1,email:1}}).toArray();
+    if(rows.length)await this.revocations.bulkWrite(rows.map(row=>({replaceOne:{filter:{_id:row._id},replacement:{_id:row._id,accountId,email:row.email,reason,expireAt:new Date(Date.now()+7*86400000)},upsert:true}})));
+    await this.sessions.deleteMany({accountId});
+  }
   async addUpload(sessionId: string, blobId: string, name: string, type: string, size: number): Promise<Upload> {
     const upload = { id: randomBytes(24).toString('base64url'), sessionHash: hash(sessionId), blobId, name, type, size, expiresAt: Date.now() + 3600000 };
     await this.uploads.insertOne({ _id: upload.id, sessionHash: upload.sessionHash, blobId, name, type, size, expiresAt: upload.expiresAt, expireAt: new Date(upload.expiresAt) });
@@ -136,7 +152,7 @@ export class Store {
     await Promise.all([
       this.sends.deleteMany({ expireAt: { $lte: new Date(now) } }),
       this.uploads.deleteMany({ expiresAt: { $lte: now } }),
-      this.sessions.deleteMany({ $or: [{ absoluteExpiresAt: { $lte: now } }, { touchedAt: { $lte: now - this.config.SESSION_IDLE_MINUTES * 60000 } }] }),
+      this.sessions.deleteMany({ expireAt: { $lte: new Date(now) } }),
     ]);
   }
 }

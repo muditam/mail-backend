@@ -3,7 +3,7 @@ import {attachmentName} from './attachmentName.js';
 import { classifySafety } from './safety.js';
 import { createHash, randomBytes } from 'node:crypto';
 import type { Config } from './config.js';
-import { AppError, unavailable } from './errors.js';
+import { AppError, sessionExpired, unavailable } from './errors.js';
 import type { Session, Store, Token } from './store.js';
 
 const CORE='urn:ietf:params:jmap:core', MAIL='urn:ietf:params:jmap:mail', SUBMISSION='urn:ietf:params:jmap:submission';
@@ -55,13 +55,13 @@ export class Stalwart {
   }
   private account(s:JSession){const id=s.primaryAccounts?.[MAIL];if(!id||!s.accounts?.[id]?.accountCapabilities?.[MAIL]||!s.capabilities?.[CORE]||!s.capabilities?.[MAIL])throw unavailable();return id;}
   async discover(accessToken:string):Promise<JSession>{const r=await this.json(this.config.STALWART_JMAP_SESSION_URL,{headers:{authorization:`Bearer ${accessToken}`}});if(r.status!==200||!r.body?.apiUrl||!r.body?.uploadUrl||!r.body?.downloadUrl)throw unavailable();this.safeUrl(r.body.apiUrl);this.safeUrl(r.body.uploadUrl);this.safeUrl(r.body.downloadUrl);return r.body;}
-  private async token(s:Session):Promise<string>{if(s.token.expires_at>Date.now()+30000)return s.token.access_token;if(!s.token.refresh_token){await this.store.delete(s.id);throw new AppError('SESSION_EXPIRED',401,'Please sign in again.');}
+  private async token(s:Session):Promise<string>{if(s.token.expires_at>Date.now()+30000)return s.token.access_token;if(!s.token.refresh_token){await this.store.delete(s.id,'upstream_refresh_unavailable');throw sessionExpired('upstream_refresh_unavailable');}
     const body=new URLSearchParams({grant_type:'refresh_token',refresh_token:s.token.refresh_token,client_id:this.config.OAUTH_CLIENT_ID});
     const r=await this.json(this.config.STALWART_TOKEN_URL,{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body});
-    if(r.status!==200||typeof r.body?.access_token!=='string'){await this.store.delete(s.id);throw new AppError('SESSION_EXPIRED',401,'Please sign in again.');}
+    if(r.status!==200||typeof r.body?.access_token!=='string'){await this.store.delete(s.id,'upstream_refresh_rejected');throw sessionExpired('upstream_refresh_rejected');}
     s.token={access_token:r.body.access_token,refresh_token:r.body.refresh_token||s.token.refresh_token,expires_at:Date.now()+Math.max(1,Number(r.body.expires_in)||3600)*1000};await this.store.updateToken(s.id,s.token);return s.token.access_token;
   }
-  private async context(s:Session){const access=await this.token(s),session=await this.discover(access);if(this.account(session)!==s.accountId){await this.store.delete(s.id);throw new AppError('SESSION_EXPIRED',401,'Please sign in again.');}return {access,session};}
+  private async context(s:Session){const access=await this.token(s),session=await this.discover(access);if(this.account(session)!==s.accountId){await this.store.delete(s.id,'upstream_account_changed');throw sessionExpired('upstream_account_changed');}return {access,session};}
   private async call(s:Session,calls:Call[],submission=false):Promise<any[]>{const {access,session}=await this.context(s);let r:Response;
     try{r=await this.fetcher(this.safeUrl(session.apiUrl),{method:'POST',headers:{authorization:`Bearer ${access}`,'content-type':'application/json'},body:JSON.stringify({using:[CORE,MAIL,...(submission?[SUBMISSION]:[])],methodCalls:calls}),signal:timeout(submission?20000:12000)});}catch{throw submission?new AppError('SEND_STATUS_UNKNOWN',503,'Could not confirm send. Check Sent before retrying.'):unavailable();}
     if(!r.ok)throw unavailable();let result:Reply;try{result=await r.json() as Reply;}catch{throw unavailable();}
