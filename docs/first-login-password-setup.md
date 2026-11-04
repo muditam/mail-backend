@@ -49,3 +49,9 @@ Source references:
 ## Authentication diagnostics
 
 Structured backend events record login, password setup stages, logout and session rejection reasons. `sessionRef` is a domain-separated HMAC of the session hash; it cannot be used as a cookie or CSRF token. Logs include the authenticated email/account and request ID, never password fields or OAuth credentials. `session_revocations` retains account/email, hashed session identifier and reason for seven days with a MongoDB TTL index. Revocation records are written before deletion; existing policy version checks continue to deny sessions after a password change. Expired rows can explain idle/absolute timeouts while present; after TTL removal or for pre-deployment deletions the honest result is `unknown_session`. Missing cookies cannot be assigned to an employee. No additional environment variables are needed.
+
+## Password rejection messages
+
+Local validation reports too short (under 8), too long (over 128), whitespace-only and unchanged-password errors separately. Exactly 8 and 128 characters are included in the length range. The frontend shows the same local length guidance and renders safe backend rejection messages while preserving editable fields.
+
+For Stalwart `notUpdated.singleton` errors of type `invalidProperties`, the adapter recognizes the v0.16.26 descriptions for a weak password and minimum/maximum length. It translates them into fixed public messages; length requirements are taken from a narrowly parsed numeric limit. Raw provider text, strength feedback and arbitrary descriptions are never forwarded or logged. Unrecognized policy descriptions use a safe policy fallback instead of inventing a reason. Public code remains `PASSWORD_POLICY`; internal logs get a safe `authReason`. Explicit rejection releases the onboarding operation lock so the employee can correct the input and try again. An accepted length alone does not guarantee acceptance by Stalwart's separate strength policy.

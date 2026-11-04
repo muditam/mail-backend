@@ -1,3 +1,4 @@
+import {providerPasswordPolicy} from './passwordPolicy.js';
 import {submissionOutcome} from './retries.js';
 import {attachmentName} from './attachmentName.js';
 import { classifySafety } from './safety.js';
@@ -47,7 +48,7 @@ export class Stalwart {
     const error=result?.[0]==='error'?result[1]:result?.[1]?.notUpdated?.singleton;
     if(error){
       if(result?.[0]==='error'&&!['forbidden','unknownMethod','invalidArguments','accountNotFound'].includes(error.type))throw new AppError('PASSWORD_CHANGE_UNKNOWN',503,'Could not confirm the password change. Sign in with the password that works before retrying.');
-      if(error.type==='invalidProperties')throw new AppError('PASSWORD_POLICY',400,'The mail server rejected this password. Choose a stronger password with 8–128 characters.');
+      if(error.type==='invalidProperties')throw providerPasswordPolicy(error.description);
       if(error.type==='forbidden'&&/Current secret is incorrect/.test(error.description||''))throw new AppError('PASSWORD_CURRENT_INVALID',400,'Your current password is incorrect.');
       throw new AppError('PASSWORD_CHANGE_REJECTED',403,'The mail server rejected password setup. Verify your current password or contact IT to check permissions.');
     }

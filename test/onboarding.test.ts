@@ -23,3 +23,17 @@ test('automatic enrollment is atomic across aliases and never resets completed o
 test('failed authentication cannot enroll an account',async()=>{const x=await fixture();try{
  const r=await x.app.inject({method:'POST',url:'/api/app/v1/auth/login',headers:origin,payload:{email:'employee@example.test',password:'incorrect'}});assert.equal(r.statusCode,401);assert.equal(await x.store.onboarding.get('owner'),null);
 }finally{await x.close()}});
+
+test('Stalwart password policy responses retain safe weak, short and long reasons',async()=>{const x=await fixture();try{
+ const s=await x.store.create('employee@example.test','owner',{access_token:'private',expires_at:Date.now()+3600000});let description='';
+ const adapter=new Stalwart(x.config,x.store,(async(url:any)=>new Response(JSON.stringify(String(url).endsWith('/jmap/session')?{apiUrl:'https://mail.example.test/jmap',uploadUrl:'https://mail.example.test/upload',downloadUrl:'https://mail.example.test/download',primaryAccounts:{'urn:ietf:params:jmap:mail':'owner'},accounts:{owner:{accountCapabilities:{'urn:ietf:params:jmap:mail':{},'urn:stalwart:jmap':{}}}},capabilities:{'urn:ietf:params:jmap:core':{},'urn:ietf:params:jmap:mail':{}}}:{methodResponses:[['x:AccountPassword/set',{notUpdated:{singleton:{type:'invalidProperties',properties:['secret'],description}}},'password']]}))) as any);
+ for(const [reason,expected] of [['Password is too weak. Feedback from provider.','too weak'],['Password must be at least 10 characters long.','at least 10'],['Password must be at most 64 characters long.','at most 64']]){description=reason!;await assert.rejects(adapter.setupPassword(s,'current-placeholder','new-placeholder'),(e:any)=>e.code==='PASSWORD_POLICY'&&e.status===400&&e.message.includes(expected)&&!e.message.includes('Feedback from provider'))}
+}finally{await x.close()}});
+
+test('password setup API explains boundaries, accepts 8, and unlocks an explicit provider rejection for correction',async()=>{const x=await fixture();try{
+ const {providerPasswordPolicy}=await import('../src/passwordPolicy.js');await x.store.onboarding.mark('policy-account','policy@example.test');const s=await x.store.create('policy@example.test','policy-account',{access_token:'private',expires_at:Date.now()+3600000});const headers={...origin,cookie:'webmail_sid='+s.id,'x-csrf-token':s.csrf};let calls=0;
+ x.adapter.setupPassword=async()=>{calls++;if(calls===1)throw providerPasswordPolicy('Password is too weak.');};
+ for(const [value,expected] of [['x'.repeat(7),'too short'],['x'.repeat(129),'too long']]){const r=await x.app.inject({method:'POST',url:'/api/app/v1/auth/password-setup',headers,payload:{currentPassword:'temporary',newPassword:value}});assert.equal(r.statusCode,400);assert.match(r.json().error.message,new RegExp(expected!));}assert.equal(calls,0);
+ let r=await x.app.inject({method:'POST',url:'/api/app/v1/auth/password-setup',headers,payload:{currentPassword:'temporary',newPassword:'abcdefgh'}});assert.equal(r.statusCode,400);assert.match(r.json().error.message,/too weak/);assert.equal((await x.store.onboarding.get('policy-account'))?.state,'required');
+ r=await x.app.inject({method:'POST',url:'/api/app/v1/auth/password-setup',headers,payload:{currentPassword:'temporary',newPassword:'Change8!'}});assert.equal(r.statusCode,200);assert.equal(calls,2);
+}finally{await x.close()}});
