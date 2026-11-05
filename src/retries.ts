@@ -1,3 +1,4 @@
+import {OAuthTokens} from './oauthTokens.js';
 import {createCipheriv,createDecipheriv,createHash,randomBytes,randomUUID} from 'node:crypto';
 import {type Collection,type Db,MongoServerError} from 'mongodb';
 import type {Token} from './store.js';
@@ -24,10 +25,11 @@ export function submissionOutcome(submission:any,recipients:string[]):Outcome|un
  return result;
 }
 export class RetryQueue{
+ readonly oauth:OAuthTokens;
  private jobs:Collection<RetryJob>;
  private key:Buffer;
- constructor(db:Db,private config:Config){this.jobs=db.collection<RetryJob>('delivery_retries');this.key=Buffer.from(config.SESSION_ENCRYPTION_KEY,'base64');}
- async init(){await this.jobs.createIndex({state:1,nextAt:1});await this.jobs.createIndex({accountId:1,emailId:1});await this.jobs.createIndex({accountId:1,sourceDraftId:1});await this.jobs.createIndex({expireAt:1},{expireAfterSeconds:0});}
+ constructor(db:Db,private config:Config){this.jobs=db.collection<RetryJob>('delivery_retries');this.oauth=new OAuthTokens(db,config);this.key=Buffer.from(config.SESSION_ENCRYPTION_KEY,'base64');}
+ async init(){await this.oauth.init();await this.jobs.createIndex({state:1,nextAt:1});await this.jobs.createIndex({accountId:1,emailId:1});await this.jobs.createIndex({accountId:1,sourceDraftId:1});await this.jobs.createIndex({expireAt:1},{expireAfterSeconds:0});}
  private id(accountId:string,emailId:string){return createHash('sha256').update(JSON.stringify([accountId,emailId])).digest('hex');}
  private seal(token:Token){const iv=randomBytes(12),c=createCipheriv('aes-256-gcm',this.key,iv);const data=Buffer.concat([c.update(JSON.stringify(token)),c.final()]);return Buffer.concat([iv,c.getAuthTag(),data]).toString('base64');}
  token(job:RetryJob):Token{if(!job.credential)throw Error('Retry credential unavailable');const b=Buffer.from(job.credential,'base64'),d=createDecipheriv('aes-256-gcm',this.key,b.subarray(0,12));d.setAuthTag(b.subarray(12,28));return JSON.parse(Buffer.concat([d.update(b.subarray(28)),d.final()]).toString());}

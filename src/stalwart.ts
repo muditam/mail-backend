@@ -16,10 +16,10 @@ export class Stalwart {
   private base:URL;
   constructor(private config:Config,private store:Store,private fetcher:typeof fetch=fetch){this.base=new URL(config.STALWART_URL);}
   private safeUrl(input:string){const url=new URL(input,this.base);if(url.protocol!=='https:'||url.origin!==this.base.origin)throw unavailable();return url.toString();}
-  private async json(url:string,init:RequestInit,ms=12000):Promise<{status:number;body:any}>{
+  private async json(url:string,init:RequestInit,ms=12000,followRedirects=true):Promise<{status:number;body:any}>{
     let response:Response;
     try{response=await this.fetcher(this.safeUrl(url),{...init,signal:timeout(ms),redirect:'manual'});}catch{throw unavailable();}
-    if(response.status>=300&&response.status<400){const location=response.headers.get('location');if(!location)throw unavailable();return this.json(this.safeUrl(location),init,ms);}
+    if(response.status>=300&&response.status<400){if(!followRedirects)return {status:response.status,body:{}};const location=response.headers.get('location');if(!location)throw unavailable();return this.json(this.safeUrl(location),init,ms);}
     let body:any;try{body=await response.json();}catch{throw unavailable();}
     return {status:response.status,body};
   }
@@ -56,13 +56,27 @@ export class Stalwart {
   }
   private account(s:JSession){const id=s.primaryAccounts?.[MAIL];if(!id||!s.accounts?.[id]?.accountCapabilities?.[MAIL]||!s.capabilities?.[CORE]||!s.capabilities?.[MAIL])throw unavailable();return id;}
   async discover(accessToken:string):Promise<JSession>{const r=await this.json(this.config.STALWART_JMAP_SESSION_URL,{headers:{authorization:`Bearer ${accessToken}`}});if(r.status!==200||!r.body?.apiUrl||!r.body?.uploadUrl||!r.body?.downloadUrl)throw unavailable();this.safeUrl(r.body.apiUrl);this.safeUrl(r.body.uploadUrl);this.safeUrl(r.body.downloadUrl);return r.body;}
-  private async token(s:Session):Promise<string>{if(s.token.expires_at>Date.now()+30000)return s.token.access_token;if(!s.token.refresh_token){await this.store.delete(s.id,'upstream_refresh_unavailable');throw sessionExpired('upstream_refresh_unavailable');}
-    const body=new URLSearchParams({grant_type:'refresh_token',refresh_token:s.token.refresh_token,client_id:this.config.OAUTH_CLIENT_ID});
-    const r=await this.json(this.config.STALWART_TOKEN_URL,{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body});
-    if(r.status!==200||typeof r.body?.access_token!=='string'){await this.store.delete(s.id,'upstream_refresh_rejected');throw sessionExpired('upstream_refresh_rejected');}
-    s.token={access_token:r.body.access_token,refresh_token:r.body.refresh_token||s.token.refresh_token,expires_at:Date.now()+Math.max(1,Number(r.body.expires_in)||3600)*1000};await this.store.updateToken(s.id,s.token);return s.token.access_token;
+  private async renew(token:Token):Promise<Token>{
+    if(!token.refresh_token)throw sessionExpired('upstream_refresh_unavailable');
+    const body=new URLSearchParams({grant_type:'refresh_token',refresh_token:token.refresh_token,client_id:this.config.OAUTH_CLIENT_ID});
+    let r:{status:number;body:any};
+    try{r=await this.json(this.config.STALWART_TOKEN_URL,{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body},12000,false)}catch{throw Object.assign(unavailable(),{authReason:'upstream_refresh_temporary'});}
+    if([400,401].includes(r.status)&&r.body?.error==='invalid_grant')throw sessionExpired('upstream_refresh_rejected');
+    if(r.status!==200||typeof r.body?.access_token!=='string'||!r.body.access_token||!Number.isFinite(Number(r.body.expires_in))||Number(r.body.expires_in)<=0)throw Object.assign(unavailable(),{authReason:r.body?.error==='invalid_client'?'upstream_client_rejected':'upstream_refresh_temporary'});
+    return {access_token:r.body.access_token,refresh_token:typeof r.body.refresh_token==='string'&&r.body.refresh_token?r.body.refresh_token:token.refresh_token,expires_at:Date.now()+Number(r.body.expires_in)*1000};
   }
-  private async context(s:Session){const access=await this.token(s),session=await this.discover(access);if(this.account(session)!==s.accountId){await this.store.delete(s.id,'upstream_account_changed');throw sessionExpired('upstream_account_changed');}return {access,session};}
+  private async token(s:Session):Promise<string>{
+    const coordinator=this.store.oauth??this.store.retries?.oauth;
+    // Lightweight provider test adapters may supply only already-valid credentials.
+    if(!coordinator){if(s.token.expires_at>Date.now()+30000)return s.token.access_token;throw unavailable();}
+    if(s.id){const current=await this.store.get(s.id);if(!current)throw sessionExpired('session_no_longer_valid');s.token=current.token;}
+    try{
+      const next=await coordinator.access(s.accountId,s.token,s.absoluteExpiresAt,t=>this.renew(t));
+      if(s.id){if(!await this.store.get(s.id))throw sessionExpired('session_no_longer_valid');if(next.access_token!==s.token.access_token||next.credentialId!==s.token.credentialId)await this.store.updateToken(s.id,next);}
+      s.token=next;return next.access_token;
+    }catch(error){if(s.id&&error instanceof AppError&&error.code==='SESSION_EXPIRED')await this.store.delete(s.id,error.authReason||'upstream_refresh_rejected');throw error;}
+  }
+  private async context(s:Session){const access=await this.token(s),session=await this.discover(access);if(this.account(session)!==s.accountId){if(s.id)await this.store.delete(s.id,'upstream_account_changed');throw sessionExpired('upstream_account_changed');}return {access,session};}
   private async call(s:Session,calls:Call[],submission=false):Promise<any[]>{const {access,session}=await this.context(s);let r:Response;
     try{r=await this.fetcher(this.safeUrl(session.apiUrl),{method:'POST',headers:{authorization:`Bearer ${access}`,'content-type':'application/json'},body:JSON.stringify({using:[CORE,MAIL,...(submission?[SUBMISSION]:[])],methodCalls:calls}),signal:timeout(submission?20000:12000)});}catch{throw submission?new AppError('SEND_STATUS_UNKNOWN',503,'Could not confirm send. Check Sent before retrying.'):unavailable();}
     if(!r.ok)throw unavailable();let result:Reply;try{result=await r.json() as Reply;}catch{throw unavailable();}
@@ -153,14 +167,8 @@ export class Stalwart {
     const queue=this.store.retries,job=await queue.claim(now);
     if(!job)return false;
     try{
-      let token=queue.token(job);
-      if(token.expires_at<Date.now()+90_000){
-        if(!token.refresh_token)throw Error('Retry authorization expired');
-        const r=await this.json(this.config.STALWART_TOKEN_URL,{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body:new URLSearchParams({grant_type:'refresh_token',refresh_token:token.refresh_token,client_id:this.config.OAUTH_CLIENT_ID})});
-        if(r.status!==200||typeof r.body?.access_token!=='string')throw Error('Retry authorization expired');
-        token={access_token:r.body.access_token,refresh_token:r.body.refresh_token||token.refresh_token,expires_at:Date.now()+Math.max(1,Number(r.body.expires_in)||3600)*1000};
-        if(!await queue.saveToken(job,token))return true;
-      }
+      const token=await (this.store.oauth??queue.oauth).access(job.accountId,queue.token(job),job.deadline,t=>this.renew(t),90000);
+      if(!await queue.saveToken(job,token))return true;
       if(token.expires_at<Date.now()+90_000)throw Error('Retry token lifetime too short');
       const session:Session={id:'',email:job.sender,accountId:job.accountId,csrf:'',token,createdAt:now,touchedAt:now,absoluteExpiresAt:job.deadline};
       const [email]=await this.call(session,[["Email/get",{accountId:job.accountId,ids:[job.emailId],properties:['id']},'exists']]);
