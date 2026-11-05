@@ -1,10 +1,11 @@
+import type {OAuthTokens} from './oauthTokens.js';
 import {Onboarding} from './onboarding.js';
 import {RetryQueue} from './retries.js';
 import { createCipheriv, createDecipheriv, randomBytes, createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import { MongoClient, MongoServerError, type Collection, type Db } from 'mongodb';
 import type { Config } from './config.js';
 
-export type Token = { access_token: string; refresh_token?: string; expires_at: number };
+export type Token = { credentialId?:string; access_token: string; refresh_token?: string; expires_at: number };
 export type Session = { id: string; email: string; accountId: string; csrf: string; token: Token; createdAt: number; touchedAt: number; absoluteExpiresAt: number; passwordChangeRequired?:boolean; authVersion?:string };
 export type SessionDiagnostic = {reason:string;sessionRef?:string;accountId?:string;email?:string};
 export type Upload = { id: string; sessionHash: string; blobId: string; name: string; type: string; size: number; expiresAt: number };
@@ -15,6 +16,7 @@ const hash = (s: string) => createHash('sha256').update(s).digest('hex');
 
 export class Store {
   readonly retries: RetryQueue;
+  readonly oauth:OAuthTokens;
   readonly onboarding: Onboarding;
   private key: Buffer;
   private sessions: Collection<SessionRow>;
@@ -24,6 +26,7 @@ export class Store {
 
   private constructor(private config: Config, private client: MongoClient, db: Db) {
     this.retries = new RetryQueue(db, config);
+    this.oauth = this.retries.oauth;
     this.onboarding = new Onboarding(db);
     this.key = Buffer.from(config.SESSION_ENCRYPTION_KEY, 'base64');
     this.sessions = db.collection<SessionRow>('sessions');
@@ -71,6 +74,7 @@ export class Store {
     const now = Date.now(), id = randomBytes(32).toString('base64url'), csrf = this.csrfToken(id);
     const policy=await this.onboarding.get(accountId);
     const end = now + this.config.SESSION_ABSOLUTE_HOURS * 3600000;
+    token=await this.oauth.register(accountId,token,end);
     await this.sessions.insertOne({ _id: hash(id), email, accountId, authVersion:policy?.version, csrfHash: hash(csrf), tokenCipher: this.seal(token), createdAt: now, touchedAt: now, absoluteExpiresAt: end, expireAt: new Date(end) });
     return { id, email, accountId, csrf, token, createdAt: now, touchedAt: now, absoluteExpiresAt: end, authVersion:policy?.version, passwordChangeRequired:!!policy&&policy.state!=='complete' };
   }
@@ -78,7 +82,7 @@ export class Store {
   async get(id: string, rejected?:(detail:SessionDiagnostic)=>void): Promise<Session | undefined> {
     const now = Date.now();
     const row = await this.sessions.findOneAndUpdate(
-      { _id: hash(id), absoluteExpiresAt: { $gt: now }, touchedAt: { $gt: now - this.config.SESSION_IDLE_MINUTES * 60000 } },
+      { _id: hash(id), absoluteExpiresAt: { $gt: now }, ...(this.config.SESSION_IDLE_MINUTES>0?{touchedAt:{$gt:now-this.config.SESSION_IDLE_MINUTES*60000}}:{}) },
       { $set: { touchedAt: now } }, { returnDocument: 'after' },
     );
     if (!row) {
@@ -98,7 +102,7 @@ export class Store {
   }
   async checkCsrf(id: string, csrf: string): Promise<boolean> {
     const now = Date.now();
-    const row = await this.sessions.findOne({ _id: hash(id), absoluteExpiresAt: { $gt: now }, touchedAt: { $gt: now - this.config.SESSION_IDLE_MINUTES * 60000 } });
+    const row = await this.sessions.findOne({ _id: hash(id), absoluteExpiresAt: { $gt: now }, ...(this.config.SESSION_IDLE_MINUTES>0?{touchedAt:{$gt:now-this.config.SESSION_IDLE_MINUTES*60000}}:{}) });
     if (!row) return false;
     const candidate = Buffer.from(hash(csrf), 'hex');
     const stable = Buffer.from(hash(this.csrfToken(id)), 'hex');

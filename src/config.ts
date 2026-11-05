@@ -19,8 +19,8 @@ const schema = z.object({
   SESSION_ENCRYPTION_KEY: z.string().min(1),
   MONGODB_URI: z.string().refine(v => /^mongodb(\+srv)?:\/\//.test(v), 'MONGODB_URI must be a MongoDB connection URI'),
   MONGODB_DB_NAME: z.string().regex(/^[a-zA-Z0-9_-]+$/).default('webmail'),
-  SESSION_IDLE_MINUTES: z.coerce.number().int().min(1).max(240).default(30),
-  SESSION_ABSOLUTE_HOURS: z.coerce.number().int().min(1).max(72).default(12),
+  SESSION_IDLE_MINUTES: z.coerce.number().int().min(0).max(240).default(0),
+  SESSION_ABSOLUTE_HOURS: z.coerce.number().int().min(1).max(720).default(720),
 });
 export type Config = z.infer<typeof schema>;
 export function configFrom(env: NodeJS.ProcessEnv): Config {
