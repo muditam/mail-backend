@@ -1,3 +1,4 @@
+import {batchCalls,batchHttp} from './batch-fixture.js';
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {Stalwart} from '../src/stalwart.js';
@@ -11,14 +12,14 @@ function setup(){
  const calls:any[]=[];
  const adapter=new Stalwart(config,{} as Store);
  const messages=Array.from({length:35},(_,i)=>({id:`E${i}`,mailboxIds:{[i%2?'sent':'inbox']:true},from:[{email:'alice@example.test'}],subject:'Quarterly budget',preview:'preview',body:'Need approval',receivedAt:new Date(2026,0,35-i).toISOString(),keywords:{}}));
- (adapter as any).call=async(session:Session,methods:any[])=>{
+ (adapter as any).call=batchCalls(async(session:Session,methods:any[])=>{
   assert.equal(session,s);const [method,args]=methods[0];assert.equal(args.accountId,'own-account');calls.push({method,args});
   if(method==='Mailbox/get')return [{list:args.ids[0]==='missing'?[]:[{id:args.ids[0]}]}];
   const matches=(m:any,filter:any):boolean=>!filter?true:filter.operator==='OR'?filter.conditions.some((c:any)=>matches(m,c)):filter.operator==='AND'?filter.conditions.every((c:any)=>matches(m,c)):filter.inMailbox?!!m.mailboxIds[filter.inMailbox]:filter.from?m.from[0].email.includes(filter.from):filter.subject?m.subject.includes(filter.subject):m.body.includes(filter.body);
   if(method==='Email/query')return [{ids:messages.filter(m=>matches(m,args.filter)).slice(args.position,args.position+args.limit).map(m=>m.id)}];
   if(method==='Email/get')return [{list:messages.filter(m=>args.ids.includes(m.id)).reverse()}];
   throw Error(method);
- };
+ });
  return {adapter,s,calls,config};
 }
 
@@ -45,7 +46,7 @@ test('folder search intersects mailbox and text, ordinary browsing stays unchang
 test('empty matches avoid fetching message bodies and special characters remain literal query data',async()=>{
  const {adapter,s,calls}=setup();const q='a+b & <invoice> "quoted"';
  assert.deepEqual(await adapter.messages(s,undefined,0,30,q),{messages:[]});
- assert.equal(calls.length,1);assert.equal(calls[0].args.filter.conditions[0].from,q);
+ assert.equal(calls.length,2);assert.equal(calls[0].args.filter.conditions[0].from,q);
 });
 test('search API validates input, uses the signed-in account, and limits rapid searches',async()=>{
  const {config,s}=setup();let forwarded:any[]=[];
@@ -69,13 +70,15 @@ test('provider search errors and malformed replies surface as errors, not no-mat
  const session={id:'provider-search',accountId:'A',token:{access_token:'token',expires_at:Date.now()+3600000},touchedAt:Date.now(),absoluteExpiresAt:Date.now()+43200000} as Session;
  const store={get:async()=>session} as unknown as Store;
  let query:any={},get:any={list:[]},status=200,errorType='';
- const adapter=new Stalwart(config,store,async(input,init)=>{
+ const fakeProvider:typeof fetch=async(input,init)=>{
+  const batched=init?.body&&await batchHttp(input,init,(input,init)=>fakeProvider(input,init));if(batched)return batched;
   if(String(input).endsWith('/.well-known/jmap'))return new Response(JSON.stringify({apiUrl:'https://mail.test/jmap',uploadUrl:'https://mail.test/upload',downloadUrl:'https://mail.test/download',accounts:{A:{accountCapabilities:{'urn:ietf:params:jmap:mail':{}}}},primaryAccounts:{'urn:ietf:params:jmap:mail':'A'},capabilities:{'urn:ietf:params:jmap:core':{},'urn:ietf:params:jmap:mail':{}}}));
   const [method,args,tag]=JSON.parse(String(init?.body)).methodCalls[0];
   assert.equal(args.accountId,'A');
   if(method==='Email/query')assert.deepEqual(args.filter,{operator:'OR',conditions:[{from:'bodyonlytoken'},{subject:'bodyonlytoken'},{body:'bodyonlytoken'}]});
   return new Response(JSON.stringify({methodResponses:[[errorType?'error':method,errorType?{type:errorType}:method==='Email/query'?query:get,tag]]}),{status});
- });
+ };
+ const adapter=new Stalwart(config,store,fakeProvider);
  const app=buildApp(config,store,adapter);
  const search=()=>app.inject({method:'GET',url:'/api/app/v1/messages?q=bodyonlytoken',headers:{cookie:'webmail_sid=provider-search'}});
  try{

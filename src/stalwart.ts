@@ -1,3 +1,4 @@
+import {timed} from './timings.js';
 import {providerPasswordPolicy} from './passwordPolicy.js';
 import {submissionOutcome} from './retries.js';
 import {attachmentName} from './attachmentName.js';
@@ -71,30 +72,39 @@ export class Stalwart {
     if(!coordinator){if(s.token.expires_at>Date.now()+30000)return s.token.access_token;throw unavailable();}
     if(s.id){const current=await this.store.get(s.id);if(!current)throw sessionExpired('session_no_longer_valid');s.token=current.token;}
     try{
-      const next=await coordinator.access(s.accountId,s.token,s.absoluteExpiresAt,t=>this.renew(t));
+      const next=await timed('oauth',()=>coordinator.access(s.accountId,s.token,s.absoluteExpiresAt,t=>this.renew(t)));
       if(s.id){if(!await this.store.get(s.id))throw sessionExpired('session_no_longer_valid');if(next.access_token!==s.token.access_token||next.credentialId!==s.token.credentialId)await this.store.updateToken(s.id,next);}
       s.token=next;return next.access_token;
     }catch(error){if(s.id&&error instanceof AppError&&error.code==='SESSION_EXPIRED')await this.store.delete(s.id,error.authReason||'upstream_refresh_rejected');throw error;}
   }
-  private async context(s:Session){const access=await this.token(s),session=await this.discover(access);if(this.account(session)!==s.accountId){if(s.id)await this.store.delete(s.id,'upstream_account_changed');throw sessionExpired('upstream_account_changed');}return {access,session};}
+  private async context(s:Session){const access=await timed('token',()=>this.token(s)),session=await timed('discovery',()=>this.discover(access));if(this.account(session)!==s.accountId){if(s.id)await this.store.delete(s.id,'upstream_account_changed');throw sessionExpired('upstream_account_changed');}return {access,session};}
   private async call(s:Session,calls:Call[],submission=false):Promise<any[]>{const {access,session}=await this.context(s);let r:Response;
-    try{r=await this.fetcher(this.safeUrl(session.apiUrl),{method:'POST',headers:{authorization:`Bearer ${access}`,'content-type':'application/json'},body:JSON.stringify({using:[CORE,MAIL,...(submission?[SUBMISSION]:[])],methodCalls:calls}),signal:timeout(submission?20000:12000)});}catch{throw submission?new AppError('SEND_STATUS_UNKNOWN',503,'Could not confirm send. Check Sent before retrying.'):unavailable();}
-    if(!r.ok)throw unavailable();let result:Reply;try{result=await r.json() as Reply;}catch{throw unavailable();}
+    try{r=await timed('jmap',()=>this.fetcher(this.safeUrl(session.apiUrl),{method:'POST',headers:{authorization:`Bearer ${access}`,'content-type':'application/json'},body:JSON.stringify({using:[CORE,MAIL,...(submission?[SUBMISSION]:[])],methodCalls:calls}),signal:timeout(submission?20000:12000)}));}catch{throw submission?new AppError('SEND_STATUS_UNKNOWN',503,'Could not confirm send. Check Sent before retrying.'):unavailable();}
+    if(!r.ok)throw unavailable();let result:Reply;try{result=await timed('jmap_decode',()=>r.json()) as Reply;}catch{throw unavailable();}
     if(!Array.isArray(result.methodResponses)||result.methodResponses.length<calls.length)throw unavailable();
-    return result.methodResponses.slice(0,calls.length).map(([name,value],i)=>{if(name==='error')throw unavailable();if(name!==calls[i]?.[0])throw unavailable();return value;});
+    return result.methodResponses.slice(0,calls.length).map(([name,value],i)=>{if(name==='error')throw unavailable();if(name!==calls[i]?.[0]||result.methodResponses[i]?.[2]!==calls[i]?.[2])throw unavailable();return value;});
   }
   async mailboxes(s:Session){const [r]=await this.call(s,[['Mailbox/get',{accountId:s.accountId,properties:['id','name','role','unreadEmails','totalEmails']},'m']]);return (r.list||[]).map((m:any)=>({id:m.id,name:m.name,role:m.role||undefined,unreadCount:m.unreadEmails||0,totalCount:m.totalEmails||0}));}
-  async messages(s:Session,mailboxId:string|undefined,cursor:number,limit:number,search?:string,starred?:boolean){if(mailboxId){const [box]=await this.call(s,[['Mailbox/get',{accountId:s.accountId,ids:[mailboxId],properties:['id']},'m']]);if(!box.list?.length)throw new AppError('MAILBOX_NOT_FOUND',404,'Mailbox not found.');}
+  async messages(s:Session,mailboxId:string|undefined,cursor:number,limit:number,search?:string,starred?:boolean){
     const match=search?{operator:'OR',conditions:[{from:search},{subject:search},{body:search}]}:undefined;
     const conditions=[...(mailboxId?[{inMailbox:mailboxId}]:[]),...(match?[match]:[]),...(starred?[{hasKeyword:'$flagged'}]:[])];
     const filter=conditions.length>1?{operator:'AND',conditions}:conditions[0];
-    const [query]=await this.call(s,[['Email/query',{accountId:s.accountId,filter,sort:[{property:'receivedAt',isAscending:false}],position:cursor,limit:limit+1},'q']]);if(!Array.isArray(query?.ids)||query.ids.some((id:unknown)=>typeof id!=='string'||!id))throw unavailable();
-    const ids=query.ids.slice(0,limit);if(!ids.length)return {messages:[]};
-    const [get]=await this.call(s,[['Email/get',{accountId:s.accountId,ids,properties:['id','mailboxIds','from','to','subject','preview','receivedAt','keywords','attachments']},'e']]);if(!Array.isArray(get?.list)||get.list.some((m:any)=>!m||typeof m.id!=='string'))throw unavailable();
+    // Result references let Stalwart query then fetch in one authenticated HTTP request.
+    // Fetch limit+1 summaries for the cursor, then expose only the requested page.
+    const methods:Call[]=[...(mailboxId?[['Mailbox/get',{accountId:s.accountId,ids:[mailboxId],properties:['id']},'m'] as Call]:[]),
+      ['Email/query',{accountId:s.accountId,filter,sort:[{property:'receivedAt',isAscending:false}],position:cursor,limit:limit+1},'q'],
+      ['Email/get',{accountId:s.accountId,'#ids':{resultOf:'q',name:'Email/query',path:'/ids'},properties:['id','mailboxIds','from','to','subject','preview','receivedAt','keywords','attachments']},'e']];
+    const results=await this.call(s,methods);
+    if(mailboxId&&!results[0]?.list?.some((box:any)=>box.id===mailboxId))throw new AppError('MAILBOX_NOT_FOUND',404,'Mailbox not found.');
+    const [query,get]=results.slice(mailboxId?1:0);
+    if(!Array.isArray(query?.ids)||query.ids.length>limit+1||query.ids.some((id:unknown)=>typeof id!=='string'||!id))throw unavailable();
+    const ids=query.ids.slice(0,limit);
+    if(!Array.isArray(get?.list)||get.list.some((m:any)=>!m||typeof m.id!=='string'))throw unavailable();
+    if(!ids.length)return {messages:[]};
     const byId=new Map(get.list.map((m:any)=>[m.id,m]));
     // Only explicitly vanished messages may be absent between query and retrieval.
     if(ids.some((id:string)=>!byId.has(id)&&!get.notFound?.includes(id)))throw unavailable();
-    const retries=await this.store.retries?.summaries(s.accountId,ids);
+    const retries=await timed('retry_summaries',async()=>this.store.retries?.summaries(s.accountId,ids));
     return {messages:ids.map((id:string)=>({...this.summary(byId.get(id)),...(retries?.has(id)?{deliveryRetry:retries.get(id)}:{})})).filter((m:any)=>m.id),nextCursor:query.ids.length>limit?String(cursor+limit):undefined};
   }
   private summary(m:any){if(!m)return null;return {safety:classifySafety(m,this.config),id:m.id,mailboxIds:Object.keys(m.mailboxIds||{}),from:m.from||[],to:m.to||[],subject:m.subject||'',preview:m.preview||'',receivedAt:m.receivedAt||new Date(0).toISOString(),isRead:!!m.keywords?.['$seen'],hasAttachment:!!m.attachments?.length,keywords:m.keywords||{}};}

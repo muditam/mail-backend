@@ -1,3 +1,4 @@
+import {batchHttp} from './batch-fixture.js';
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {Stalwart} from '../src/stalwart.js';
@@ -16,6 +17,7 @@ function fixture(){
   let body:any;
   if(String(input).endsWith('/.well-known/jmap'))body={apiUrl:'https://mail.test/jmap',uploadUrl:'https://mail.test/upload/{accountId}',downloadUrl:'https://mail.test/download/{accountId}/{blobId}/{name}',accounts:{A:{accountCapabilities:{'urn:ietf:params:jmap:mail':{}}}},primaryAccounts:{'urn:ietf:params:jmap:mail':'A'},capabilities:{'urn:ietf:params:jmap:core':{},'urn:ietf:params:jmap:mail':{}}};
   else{
+   const batched=await batchHttp(input,init,fetcher);if(batched)return batched;
    const request=JSON.parse(String(init?.body));const [method,args,tag]=request.methodCalls[0];calls.push({method,args});assert.equal(args.accountId,'A');
    let result:any;
    if(method==='Mailbox/get')result={list:boxes.filter(b=>!args.ids||args.ids.includes(b.id)).map(b=>({...b,totalEmails:message.mailboxIds[b.id]?1:0,unreadEmails:message.mailboxIds[b.id]&&!message.keywords['$seen']?1:0}))};

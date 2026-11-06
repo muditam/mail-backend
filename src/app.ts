@@ -1,3 +1,4 @@
+import {requestTimings,timed,timingSummary} from './timings.js';
 import {validateNewPassword} from './passwordPolicy.js';
 import Fastify, {type FastifyInstance, type FastifyRequest} from 'fastify';
 import multipart from '@fastify/multipart';
@@ -22,6 +23,8 @@ export function buildApp(config:Config,store:Store,stalwart:Stalwart):FastifyIns
  const app=Fastify({logger:{level:'info',redact:{paths:['req.headers.authorization','req.headers.cookie','res.headers.set-cookie'],censor:'[redacted]'}},bodyLimit:1200000,trustProxy:false});
  app.register(multipart,{limits:{files:1,fileSize:20*1024*1024,fields:0,parts:1}});
  app.setErrorHandler((error,request,reply)=>{let e=error instanceof AppError?error:unavailable();if((error as any).code==='FST_REQ_FILE_TOO_LARGE')e=new AppError('ATTACHMENT_TOO_LARGE',413,'Attachment exceeds 20 MB.');else if((error as any).code==='FST_ERR_CTP_BODY_TOO_LARGE')e=new AppError('INVALID_REQUEST',413,'Request is too large.');const active=authenticated.get(request);if(request.routeOptions.url==='/api/app/v1/auth/login')request.log.info({event:'auth_login_failed',code:e.code,status:e.status},'Login failed');if(active&&(request.routeOptions.url?.startsWith('/api/app/v1/auth/')||['SESSION_EXPIRED','CSRF_FAILED'].includes(e.code)||!!e.authReason))request.log.warn({event:'auth_request_failed',accountId:active.accountId,email:active.email,sessionRef:store.sessionRef?.(active.id),reason:e.authReason,code:e.code,status:e.status},'Authentication action failed');request.log.warn({requestId:request.id,route:request.routeOptions.url,code:e.code,status:e.status},'request failed');reply.code(e.status).send({error:{code:e.code,message:e.message,requestId:request.id,...(e.details?{details:e.details}:{})}});});
+ app.addHook('onRequest',(_request,_reply,done)=>requestTimings.run(new Map(),done));
+ app.addHook('onResponse',async(request,reply)=>{request.log.info({event:'request_timings',route:request.routeOptions.url,status:reply.statusCode,stages:timingSummary()},'Request stage timings');});
  app.addHook('onRequest',async(request,reply)=>{reply.header('Cache-Control','no-store');reply.header('X-Content-Type-Options','nosniff');});
  const authenticated=new WeakMap<FastifyRequest,Session>();
  const sessionCookie=(s:Session)=>{
@@ -30,12 +33,13 @@ export function buildApp(config:Config,store:Store,stalwart:Stalwart):FastifyIns
   return secureCookie(config,s.id,Math.max(0,Math.floor((deadline-Date.now())/1000)));
  };
  app.addHook('onSend',async(request,reply,payload)=>{
+  const durations=timingSummary();if(Object.keys(durations).length)reply.header('Server-Timing',Object.entries(durations).map(([name,value])=>`${name};dur=${value.ms}`).join(', '));
   const s=authenticated.get(request);
   // Failed requests do not renew cookies; explicit login/logout cookies take precedence.
   if(s&&reply.statusCode>=200&&reply.statusCode<300&&!reply.hasHeader('Set-Cookie'))reply.header('Set-Cookie',sessionCookie(s));
   return payload;
  });
- const session=async(request:FastifyRequest)=>{const sid=cookie(request);const s=sid&&await store.get(sid,detail=>request.log.info({event:'auth_session_rejected',...detail},'Session rejected'));if(!sid)request.log.info({event:'auth_session_rejected',reason:'missing_cookie'},'Session cookie missing');if(!s)throw new AppError('SESSION_EXPIRED',401,'Please sign in again.');authenticated.set(request,s);if(s.passwordChangeRequired&&!['/api/app/v1/auth/session','/api/app/v1/auth/logout','/api/app/v1/auth/password-setup'].includes(request.routeOptions.url||''))throw new AppError('PASSWORD_CHANGE_REQUIRED',403,'Set your new password before opening mail.');return s;};
+ const session=async(request:FastifyRequest)=>{const sid=cookie(request);const s=sid&&await timed('session',()=>store.get(sid,detail=>request.log.info({event:'auth_session_rejected',...detail},'Session rejected')));if(!sid)request.log.info({event:'auth_session_rejected',reason:'missing_cookie'},'Session cookie missing');if(!s)throw new AppError('SESSION_EXPIRED',401,'Please sign in again.');authenticated.set(request,s);if(s.passwordChangeRequired&&!['/api/app/v1/auth/session','/api/app/v1/auth/logout','/api/app/v1/auth/password-setup'].includes(request.routeOptions.url||''))throw new AppError('PASSWORD_CHANGE_REQUIRED',403,'Set your new password before opening mail.');return s;};
  const state=async(request:FastifyRequest)=>{origin(request,config);const s=await session(request);const csrf=request.headers['x-csrf-token'];if(typeof csrf!=='string'||!await store.checkCsrf(s.id,csrf))throw new AppError('CSRF_FAILED',403,'Invalid CSRF token.');return s;};
  app.get('/health',async()=>({status:'ok'}));
  app.get('/ready',async()=>{await store.ready();return {status:'ok'};});
