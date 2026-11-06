@@ -1,3 +1,4 @@
+import {timed} from './timings.js';
 import type {OAuthTokens} from './oauthTokens.js';
 import {Onboarding} from './onboarding.js';
 import {RetryQueue} from './retries.js';
@@ -81,17 +82,18 @@ export class Store {
   sessionRef(id:string){return createHmac('sha256',this.key).update('webmail:audit:v1\0').update(hash(id)).digest('hex').slice(0,32);}
   async get(id: string, rejected?:(detail:SessionDiagnostic)=>void): Promise<Session | undefined> {
     const now = Date.now();
-    const row = await this.sessions.findOneAndUpdate(
-      { _id: hash(id), absoluteExpiresAt: { $gt: now }, ...(this.config.SESSION_IDLE_MINUTES>0?{touchedAt:{$gt:now-this.config.SESSION_IDLE_MINUTES*60000}}:{}) },
-      { $set: { touchedAt: now } }, { returnDocument: 'after' },
-    );
+    const filter={_id:hash(id),absoluteExpiresAt:{$gt:now},...(this.config.SESSION_IDLE_MINUTES>0?{touchedAt:{$gt:now-this.config.SESSION_IDLE_MINUTES*60000}}:{})};
+    // Fixed-lifetime sessions need an authoritative read, not a write on every lookup.
+    const row=await timed('session_db',()=>this.config.SESSION_IDLE_MINUTES>0
+      ?this.sessions.findOneAndUpdate(filter,{$set:{touchedAt:now}},{returnDocument:'after'})
+      :this.sessions.findOne(filter));
     if (!row) {
       const previous=await this.sessions.findOne({_id:hash(id)});
       const revoked=await this.revocations.findOne({_id:hash(id),expireAt:{$gt:new Date(now)}});
       rejected?.({sessionRef:this.sessionRef(id),reason:revoked?.reason||(previous?(previous.absoluteExpiresAt<=now?'absolute_timeout':'idle_timeout'):'unknown_session'),accountId:revoked?.accountId||previous?.accountId,email:revoked?.email||previous?.email});
       return undefined;
     }
-    const policy=await this.onboarding.get(row.accountId);
+    const policy=await timed('policy_db',()=>this.onboarding.get(row.accountId));
     if(policy&&policy.version!==row.authVersion){rejected?.({reason:policy.state==='complete'?'password_changed':'auth_policy_changed',sessionRef:this.sessionRef(id),accountId:row.accountId,email:row.email});return undefined;}
     return { authVersion:row.authVersion,passwordChangeRequired:!!policy&&policy.state!=='complete', id, email: row.email, accountId: row.accountId, csrf: '', token: this.open(row.tokenCipher), createdAt: row.createdAt, touchedAt: row.touchedAt, absoluteExpiresAt: row.absoluteExpiresAt };
   }

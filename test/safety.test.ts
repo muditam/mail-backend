@@ -1,3 +1,4 @@
+import {batchCalls,batchHttp} from './batch-fixture.js';
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {classifySafety} from '../src/safety.js';
@@ -63,11 +64,11 @@ test('report route enforces session, CSRF, empty payload and propagates delivery
 test('list and detail classify without requesting authentication or spam headers',async()=>{
  const adapter=new Stalwart({...config,STALWART_URL:'https://mail.test'} as Config,{} as Store);
  const m={...message('a@muditam.com'),id:'E1',mailboxIds:{inbox:true}};
- (adapter as any).call=async(_s:Session,calls:any[])=>{const [method,args]=calls[0];
+ (adapter as any).call=batchCalls(async(_s:Session,calls:any[])=>{const [method,args]=calls[0];
   if(method==='Mailbox/get')return [{list:[{id:'inbox'}]}];
   if(method==='Email/query')return [{ids:['E1']}];
   assert.ok(!args.properties.some((p:string)=>p.startsWith('header:')));return [{list:[m]}];
- };
+ });
  const s={accountId:'A'} as Session;
  const list=await adapter.messages(s,'inbox',0,30),detail=await adapter.message(s,'E1');
  assert.equal(list.messages[0].safety.classification,'internal');

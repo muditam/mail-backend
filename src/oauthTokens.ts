@@ -1,3 +1,4 @@
+import {timed} from './timings.js';
 import {createCipheriv,createDecipheriv,createHmac,randomBytes,randomUUID} from 'node:crypto';
 import {type Collection,type Db,MongoServerError} from 'mongodb';
 import type {Token} from './store.js';
@@ -18,9 +19,11 @@ export class OAuthTokens{
   return managed;
  }
  async access(accountId:string,input:Token,deadline:number,refresh:(token:Token)=>Promise<Token>,minimumValidity=30000):Promise<Token>{
-  const managed=await this.register(accountId,input,deadline);const id=managed.credentialId!;
+  // Registered grants must never be recreated from stale session snapshots.
+  const managed=input.credentialId?input:await this.register(accountId,input,deadline);const id=managed.credentialId!;
   for(let attempt=0;attempt<120;attempt++){
-   const now=Date.now(),row=await this.rows.findOne({_id:id,accountId});if(!row)throw temporary('upstream_credential_missing');
+   const now=Date.now(),row=await timed('credential_db',()=>this.rows.findOne({_id:id,accountId}));if(!row)throw temporary('upstream_credential_missing');
+   if(row.expireAt.getTime()<deadline)await this.rows.updateOne({_id:id,accountId},{$max:{expireAt:new Date(deadline)}});
    if(row.state==='revoked')throw sessionExpired('upstream_refresh_rejected');
    if(row.state==='uncertain')throw temporary('upstream_refresh_uncertain');
    if(row.state==='refreshing'){
@@ -34,7 +37,7 @@ export class OAuthTokens{
    if((row.retryAt??0)>now)throw temporary('upstream_refresh_backoff');
    const owner=randomUUID();const claimed=await this.rows.updateOne({_id:id,accountId,state:'ready',tokenCipher:row.tokenCipher,$or:[{retryAt:{$exists:false}},{retryAt:{$lte:now}}]},{$set:{state:'refreshing',owner,leaseUntil:now+30000}});if(!claimed.modifiedCount)continue;
    let next:Token;
-   try{next={...await refresh(token),credentialId:id}}
+   try{next={...await timed('upstream_refresh',()=>refresh(token)),credentialId:id}}
    catch(error){
     const revoked=error instanceof AppError&&error.code==='SESSION_EXPIRED';
     await this.rows.updateOne({_id:id,state:'refreshing',owner},{$set:{state:revoked?'revoked':'ready',retryAt:Date.now()+5000},$unset:{owner:'',leaseUntil:'',...(revoked?{tokenCipher:''}:{})}});

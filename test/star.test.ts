@@ -1,3 +1,4 @@
+import {batchCalls,batchHttp} from './batch-fixture.js';
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {Stalwart} from '../src/stalwart.js';
@@ -34,12 +35,12 @@ test('star never reports a failed or missing update as successful',async()=>{
 });
 test('Starred uses server-side filtering, supports text intersection and keeps pagination',async()=>{
  const adapter=new Stalwart(config,{} as Store),calls:any[]=[];
- (adapter as any).call=async(s:Session,methods:any[])=>{
+ (adapter as any).call=batchCalls(async(s:Session,methods:any[])=>{
   assert.equal(s,session);const [method,args]=methods[0];assert.equal(args.accountId,'A');calls.push({method,args});
   if(method==='Email/query')return [{ids:['E1','E2']}];
   if(method==='Mailbox/get')return [{list:[{id:'inbox'}]}];
   return [{list:[{id:'E1',keywords:{'$flagged':true},mailboxIds:{inbox:true}}]}];
- };
+ });
  const result=await adapter.messages(session,undefined,0,1,undefined,true);
  assert.deepEqual(calls[0].args.filter,{hasKeyword:'$flagged'});assert.equal(result.nextCursor,'1');assert.equal(result.messages[0].keywords['$flagged'],true);
  await adapter.messages(session,'inbox',1,1,'budget',true);
