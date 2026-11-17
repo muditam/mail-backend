@@ -108,7 +108,23 @@ export class Stalwart {
     return {messages:ids.map((id:string)=>({...this.summary(byId.get(id)),...(retries?.has(id)?{deliveryRetry:retries.get(id)}:{})})).filter((m:any)=>m.id),nextCursor:query.ids.length>limit?String(cursor+limit):undefined};
   }
   private summary(m:any){if(!m)return null;return {safety:classifySafety(m,this.config),id:m.id,mailboxIds:Object.keys(m.mailboxIds||{}),from:m.from||[],to:m.to||[],subject:m.subject||'',preview:m.preview||'',receivedAt:m.receivedAt||new Date(0).toISOString(),isRead:!!m.keywords?.['$seen'],hasAttachment:!!m.attachments?.length,keywords:m.keywords||{}};}
-  async message(s:Session,id:string){const [r]=await this.call(s,[['Email/get',{accountId:s.accountId,ids:[id],properties:['id','mailboxIds','from','to','cc','bcc','subject','preview','receivedAt','keywords','attachments','textBody','bodyValues'] ,fetchTextBodyValues:true},'e']]);const m=r.list?.[0];if(!m)throw new AppError('MESSAGE_NOT_FOUND',404,'Message not found.');const body=(m.textBody||[]).map((p:any)=>m.bodyValues?.[p.partId]?.value||'').join('\n');const attachments=await Promise.all((m.attachments||[]).map(async(a:any)=>{const up=await this.store.addUpload(s.id,a.blobId,attachmentName(a.name,a.type),a.type||'application/octet-stream',a.size||0);return {id:up.id,name:up.name,type:up.type,size:up.size};}));const retry=await this.store.retries?.get(s.accountId,id);return {...this.summary(m),...(retry?{deliveryRetry:this.store.retries.summary(retry)}:{}),cc:m.cc||[],bcc:m.bcc||[],bodyText:body,attachments};}
+  async message(s:Session,id:string){
+    const [r]=await this.call(s,[['Email/get',{
+      accountId:s.accountId,ids:[id],
+      properties:['id','mailboxIds','from','to','cc','bcc','subject','preview','receivedAt','keywords','attachments','textBody','htmlBody','bodyValues'],
+      fetchTextBodyValues:true,fetchHTMLBodyValues:true,
+    },'e']]);
+    const m=r.list?.[0];if(!m)throw new AppError('MESSAGE_NOT_FOUND',404,'Message not found.');
+    const body=(m.textBody||[]).map((p:any)=>m.bodyValues?.[p.partId]?.value||'').join('\n');
+    // HTML is transported as JSON, never executed here. The reader sanitizes before display.
+    const html=(m.htmlBody||[]).map((p:any)=>m.bodyValues?.[p.partId]?.value||'').join('\n');
+    const attachments=await Promise.all((m.attachments||[]).map(async(a:any)=>{
+      const up=await this.store.addUpload(s.id,a.blobId,attachmentName(a.name,a.type),a.type||'application/octet-stream',a.size||0);
+      return {id:up.id,name:up.name,type:up.type,size:up.size};
+    }));
+    const retry=await this.store.retries?.get(s.accountId,id);
+    return {...this.summary(m),...(retry?{deliveryRetry:this.store.retries.summary(retry)}:{}),cc:m.cc||[],bcc:m.bcc||[],bodyText:body,...(html?{bodyHtml:html}:{}),attachments};
+  }
   async report(s:Session,id:string){
     if(!this.config.IT_REPORT_EMAIL)throw new AppError('REPORT_UNAVAILABLE',503,'IT reporting is not configured.');
     const [r]=await this.call(s,[['Email/get',{accountId:s.accountId,ids:[id],properties:['id','from','subject','receivedAt']},'e']]);
